@@ -62,7 +62,11 @@ class DPTHeadTemporal(DPTHead):
             else:
                 x = x[0]
 
-            x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w)).contiguous()
+            x = (
+                x.permute(0, 2, 1)
+                .reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
+                .contiguous()
+            )
 
             B, T = x.shape[0] // frame_length, frame_length
             x = self.projects[i](x)
