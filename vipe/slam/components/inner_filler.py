@@ -63,7 +63,7 @@ class InnerFiller:
         assert self.start_idx >= 0
         return self.video.n_frames - self.start_idx >= self.args.infill_chunk_size
 
-    def compute(self):
+    def compute(self, optimize_poses: bool = True):
         total_frames = self.video.n_frames
 
         # Setup initial value (for pose and disp)
@@ -113,6 +113,7 @@ class InnerFiller:
                 total_frames,
                 motion_only=not self.args.infill_dense_disp,
                 limited_disp=True,
+                optimize_poses=optimize_poses,
             )
 
         # (Optional) Metric computation of keyframe optimized disp and its original disp.

@@ -37,6 +37,7 @@ from vipe.utils.depth import reliable_depth_mask_range
 from vipe.utils.io import (
     ArtifactPath,
     read_depth_artifacts,
+    read_instance_artifacts,
     read_intrinsics_artifacts,
     read_pose_artifacts,
     read_rgb_artifacts,
@@ -106,6 +107,10 @@ class ClientClosures:
         self.scene_frame_handles: list[SceneFrameHandle] = []
         self.current_displayed_timestep: int = 0
 
+        # added
+        self.gui_playing: viser.GuiCheckboxHandle | None = None
+        self.gui_show_all_frames: viser.GuiCheckboxHandle | None = None
+
     async def stop(self):
         self.task.cancel()
         await self.task
@@ -165,6 +170,17 @@ class ClientClosures:
             async def _(_) -> None:
                 self._set_frustum_color(self.gui_colorful_frustum_toggle.value)
 
+            # 동적 객체 필터링 컨트롤 추가
+            self.gui_filter_dynamic_objects = self.client.gui.add_checkbox(
+                "Filter Dynamic Objects",
+                initial_value=True,
+                hint="Remove dynamic objects (person, car, etc.) from point cloud"
+            )
+
+            @self.gui_filter_dynamic_objects.on_update
+            async def _(_) -> None:
+                await self.on_sample_update(None)
+
             self.gui_fov = self.client.gui.add_slider("FoV", min=30.0, max=120.0, step=1.0, initial_value=60.0)
 
             @self.gui_fov.on_update
@@ -187,7 +203,9 @@ class ClientClosures:
         await self.on_sample_update(None)
 
         while True:
-            if self.gui_framerate is not None and self.gui_framerate.value > 0:
+            if (self.gui_playing is not None and self.gui_playing.value # added
+                and self.gui_framerate is not None and self.gui_framerate.value > 0
+            ):
                 self._incr_timestep()
                 await asyncio.sleep(1.0 / self.gui_framerate.value)
             else:
@@ -230,12 +248,22 @@ class ClientClosures:
                 while True:
                     yield None, None
 
-        for frame_idx, (c2w, (_, rgb), intr, camera_type, (_, depth)) in enumerate(
+        # 마스크 데이터 로더 추가
+        def none_it_mask(inner_it):
+            try:
+                for item in inner_it:
+                    yield item
+            except FileNotFoundError:
+                while True:
+                    yield None, None
+
+        for frame_idx, (c2w, (_, rgb), intr, camera_type, (_, depth), (_, instance_mask)) in enumerate(
             zip(
                 read_pose_artifacts(current_artifact.pose_path)[1].matrix().numpy(),
                 read_rgb_artifacts(current_artifact.rgb_path),
                 *read_intrinsics_artifacts(current_artifact.intrinsics_path, current_artifact.camera_type_path)[1:3],
                 none_it(read_depth_artifacts(current_artifact.depth_path)),
+                none_it_mask(read_instance_artifacts(current_artifact.mask_path)),
             )
         ):
             if frame_idx % temporal_subsample != 0:
@@ -269,8 +297,21 @@ class ClientClosures:
                     rays /= rays[..., 2:3]
 
             if depth is not None:
-                pcd = rays * depth.numpy()[::spatial_subsample, ::spatial_subsample, None]
+                # 원래 코드 (카메라 좌표계)
+                pcd = rays * depth.numpy()[::spatial_subsample, ::spatial_subsample, None]                
                 depth_mask = reliable_depth_mask_range(depth)[::spatial_subsample, ::spatial_subsample].numpy()
+                
+                # 인스턴스 마스크를 이용한 동적 객체 필터링 (GUI 설정에 따라)
+                if instance_mask is not None and self.gui_filter_dynamic_objects.value:
+                    # 인스턴스 마스크를 numpy로 변환
+                    instance_mask_np = instance_mask.cpu().numpy() if hasattr(instance_mask, 'cpu') else instance_mask
+                    # 배경(0)만 유지하고 동적 객체(1=person, 2=car 등) 필터링
+                    static_mask = (instance_mask_np == 0)
+                    # 공간 서브샘플링 적용
+                    static_mask_sub = static_mask[::spatial_subsample, ::spatial_subsample]
+                    # 깊이 마스크와 정적 마스크 결합
+                    depth_mask = depth_mask & static_mask_sub
+                    logger.info(f"Frame {frame_idx}: Applied instance mask filtering (kept {np.sum(depth_mask)} / {depth_mask.size} points)")
             else:
                 pcd, depth_mask = None, None
 
@@ -356,6 +397,22 @@ class ClientClosures:
             )
             gui_frame_control = self.client.gui.add_button_group("Control", options=["Prev", "Next"])
             self.gui_framerate = self.client.gui.add_slider("FPS", min=0, max=30, step=1.0, initial_value=15)
+            #### added ####
+            self.gui_playing = self.client.gui.add_checkbox("Playing", initial_value=False)
+            self.gui_show_all_frames = self.client.gui.add_checkbox("Show all frames", initial_value=False)
+
+            @self.gui_show_all_frames.on_update
+            async def _(_):
+                # 토글 켜면 모든 프레임 보이기, 끄면 타임라인 위치만 보이기
+                show_all = self.gui_show_all_frames.value
+                with self.client.atomic():
+                    if show_all:
+                        for h in self.scene_frame_handles:
+                            h.visible = True
+                    else:
+                        for i, h in enumerate(self.scene_frame_handles):
+                            h.visible = (i == self.gui_timestep.value)
+            ###############
 
             @gui_frame_control.on_click
             async def _(_) -> None:
@@ -371,8 +428,9 @@ class ClientClosures:
                 current_timestep = self.gui_timestep.value
                 prev_timestep = self.current_displayed_timestep
                 with self.client.atomic():
-                    self.scene_frame_handles[current_timestep].visible = True
-                    self.scene_frame_handles[prev_timestep].visible = False
+                    if not (self.gui_show_all_frames and self.gui_show_all_frames.value): # added
+                        self.scene_frame_handles[current_timestep].visible = True
+                        self.scene_frame_handles[prev_timestep].visible = False
                 self.current_displayed_timestep = current_timestep
 
     def cleanup(self):
@@ -407,7 +465,10 @@ def run_viser(base_path: Path, port: int = 20540):
     global _global_context
     _global_context = GlobalContext(artifacts=sorted(artifacts, key=lambda x: x.artifact_name))
 
-    server = viser.ViserServer(host=get_host_ip(), port=port, verbose=False)
+    # 새 코드: 모든 인터페이스에서 수신 대기
+    server = viser.ViserServer(host="0.0.0.0", port=port, verbose=False)
+    # 원래 코드 (주석 처리)
+    # server = viser.ViserServer(host=get_host_ip(), port=port, verbose=False)
     client_closures: dict[int, ClientClosures] = {}
 
     @server.on_client_connect

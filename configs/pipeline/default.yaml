@@ -3,6 +3,9 @@ defaults:
 
 instance: vipe.pipeline.default.DefaultAnnotationPipeline
 
+# Fixed camera pose mode
+assume_fixed_camera_pose: false
+
 # Init configs
 init:
   camera_type: "pinhole"

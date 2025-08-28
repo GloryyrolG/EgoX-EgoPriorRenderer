@@ -237,6 +237,7 @@ class FactorGraph:
         motion_only: bool = False,
         fixed_motion: bool = False,
         limited_disp: bool = False,
+        optimize_poses: bool = True,
     ):
         """run update operator on factor graph"""
         assert self.incremental
@@ -308,6 +309,7 @@ class FactorGraph:
                 limited_disp=limited_disp,
                 optimize_intrinsics=False,
                 optimize_rig_rotation=False,
+                optimize_poses=optimize_poses,
                 verbose=False,
             )
 
@@ -320,6 +322,7 @@ class FactorGraph:
         steps: int,
         optimize_intrinsics: bool,
         optimize_rig_rotation: bool,
+        optimize_poses: bool = True,
         solver_verbose: bool = False,
     ):
         """
@@ -390,6 +393,7 @@ class FactorGraph:
                 limited_disp=False,
                 optimize_intrinsics=optimize_intrinsics,
                 optimize_rig_rotation=optimize_rig_rotation,
+                optimize_poses=optimize_poses,
                 verbose=solver_verbose,
             )
 

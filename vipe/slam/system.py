@@ -210,6 +210,7 @@ class SLAMSystem:
         video_streams: list[VideoStream],
         rig: SE3 | None = None,
         camera_type: CameraType = CameraType.PINHOLE,
+        camera_fix: bool = False,
     ) -> SLAMOutput:
         assert len(video_streams) > 0
         resizers = [StandardResizeStreamProcessor() for _ in video_streams]
@@ -260,7 +261,7 @@ class SLAMSystem:
             else:
                 is_keyframe = False
 
-            self.frontend.run()
+            self.frontend.run(optimize_poses=not camera_fix)
 
             if self.visualize:
                 self.buffer.log(self.config.map_filter_thresh)
@@ -276,10 +277,10 @@ class SLAMSystem:
             self.buffer.log_tracks()
 
         # Run the backend to perform a global BA over the keyframes.
-        self.backend.run(7, log=self.visualize)
+        self.backend.run(7, log=self.visualize, optimize_poses=not camera_fix)
 
         # Run backend again with a new graph and cleared GRU states.
-        self.backend.run(self.config.backend_iters, update_depth=False, log=self.visualize)
+        self.backend.run(self.config.backend_iters, update_depth=False, log=self.visualize, optimize_poses=not camera_fix)
 
         # Infill poses and attributes for non-keyframe frames.
         self.inner_filler.set_start_idx(self.buffer.n_frames)
@@ -289,7 +290,7 @@ class SLAMSystem:
             images, buffer_masks = self._precompute_features(frame_data_list)
             self._add_keyframe(frame_idx, images, buffer_masks, frame_data_list, phase=2)
             if self.inner_filler.check() or frame_idx == total_n_frames - 1:
-                self.inner_filler.compute()
+                self.inner_filler.compute(optimize_poses=not camera_fix)
 
         filled_return = self.inner_filler.get_result()
 

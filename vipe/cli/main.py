@@ -36,26 +36,44 @@ from vipe.utils.viser import run_viser
 )
 @click.option("--pipeline", "-p", default="default", help="Pipeline configuration to use (default: 'default')")
 @click.option("--visualize", "-v", is_flag=True, help="Enable visualization of intermediate results")
-def infer(video: Path, output: Path, pipeline: str, visualize: bool):
+@click.option("--num_frame", "-n", type=int, default=None, help="Number of frames to process from the beginning of the video")
+@click.option("--assume_fixed_camera_pose", is_flag=True, help="Assume camera pose is fixed throughout the video (skips SLAM pose estimation)")
+def infer(video: Path, output: Path, pipeline: str, visualize: bool, num_frame: int, assume_fixed_camera_pose: bool):
     """Run inference on a video file."""
 
     logger = configure_logging()
 
-    overrides = [f"pipeline={pipeline}", f"pipeline.output.path={output}", "pipeline.output.save_artifacts=true"]
+    # Create output directory based on video name
+    video_name = video.stem  # Get filename without extension
+    video_output_path = output / video_name
+    
+    overrides = [f"pipeline={pipeline}", f"pipeline.output.path={video_output_path}", "pipeline.output.save_artifacts=true"]
     if visualize:
         overrides.append("pipeline.output.save_viz=true")
         overrides.append("pipeline.slam.visualize=true")
     else:
         overrides.append("pipeline.output.save_viz=false")
+    
+    if assume_fixed_camera_pose:
+        overrides.append("pipeline.assume_fixed_camera_pose=true")
+        logger.info("Fixed camera pose mode enabled - SLAM pose estimation will be skipped")
 
     with hydra.initialize_config_dir(config_dir=str(get_config_path()), version_base=None):
         args = hydra.compose("default", overrides=overrides)
 
     logger.info(f"Processing {video}...")
+    logger.info(f"Output will be saved to: {video_output_path}")
     vipe_pipeline = make_pipeline(args.pipeline)
 
     # Some input videos can be malformed, so we need to cache the videos to obtain correct number of frames.
-    video_stream = ProcessedVideoStream(RawMp4Stream(video), []).cache(desc="Reading video stream")
+    # Apply frame limit if specified
+    if num_frame is not None:
+        seek_range = range(0, num_frame)
+        video_stream = ProcessedVideoStream(RawMp4Stream(video, seek_range=seek_range), []).cache(desc="Reading video stream")
+        logger.info(f"Processing only first {num_frame} frames")
+    else:
+        video_stream = ProcessedVideoStream(RawMp4Stream(video), []).cache(desc="Reading video stream")
+        logger.info(f"Processing all {len(video_stream)} frames")
 
     vipe_pipeline.run(video_stream)
     logger.info("Finished")

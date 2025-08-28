@@ -386,6 +386,7 @@ class GraphBuffer:
         limited_disp: bool,
         optimize_intrinsics: bool,
         optimize_rig_rotation: bool,
+        optimize_poses: bool,
         verbose: bool,
     ):
         """
@@ -465,6 +466,8 @@ class GraphBuffer:
         )
         solver.set_retractor("pose", PoseRetractor())
         solver.set_damping("pose", damping=pose_damping, ep=pose_ep)
+        if not optimize_poses:
+            solver.set_fixed("pose")
 
         if not motion_only:
             disps_sens = rearrange(self.flattened_disps_sens, "nv h w -> nv (h w)")

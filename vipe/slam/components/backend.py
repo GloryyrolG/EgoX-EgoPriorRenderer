@@ -42,7 +42,7 @@ class SLAMBackend:
         self.args = args
         self.device = device
 
-    def _iterate_with_depth(self, graph: FactorGraph, steps: int, more_iters: bool):
+    def _iterate_with_depth(self, graph: FactorGraph, steps: int, more_iters: bool, optimize_poses: bool = True):
         steps_preintr = steps // 2
         steps_postintr = steps - steps_preintr
         graph.update_batch(
@@ -50,6 +50,7 @@ class SLAMBackend:
             steps=steps_preintr,
             optimize_intrinsics=self.args.optimize_intrinsics,
             optimize_rig_rotation=self.args.optimize_rig_rotation,
+            optimize_poses=optimize_poses,
             solver_verbose=True,
         )
         self.video.update_disps_sens(self.depth_model, frame_idx=None)
@@ -59,20 +60,22 @@ class SLAMBackend:
             steps=steps_postintr,
             optimize_intrinsics=False,
             optimize_rig_rotation=self.args.optimize_rig_rotation,
+            optimize_poses=optimize_poses,
             solver_verbose=True,
         )
 
-    def _iterate_without_depth(self, graph: FactorGraph, steps: int, more_iters: bool):
+    def _iterate_without_depth(self, graph: FactorGraph, steps: int, more_iters: bool, optimize_poses: bool = True):
         graph.update_batch(
             itrs=16 if more_iters else 8,
             steps=steps,
             optimize_intrinsics=self.args.optimize_intrinsics,
             optimize_rig_rotation=self.args.optimize_rig_rotation,
+            optimize_poses=optimize_poses,
             solver_verbose=True,
         )
 
     @torch.no_grad()
-    def run(self, steps: int = 12, update_depth: bool = True, log: bool = False):
+    def run(self, steps: int = 12, update_depth: bool = True, log: bool = False, optimize_poses: bool = True):
         """main update (reset GRU state)"""
 
         t = self.video.n_frames
@@ -99,9 +102,9 @@ class SLAMBackend:
         if len(graph.ii) > 0:
             more_iters = self.args.optimize_intrinsics or self.args.optimize_rig_rotation
             if self.depth_model is not None:
-                self._iterate_with_depth(graph, steps, more_iters)
+                self._iterate_with_depth(graph, steps, more_iters, optimize_poses)
             else:
-                self._iterate_without_depth(graph, steps, more_iters)
+                self._iterate_without_depth(graph, steps, more_iters, optimize_poses)
         else:
             # Empty graph with only one keyframe, assign sensor depth
             self.video.disps[0] = torch.where(

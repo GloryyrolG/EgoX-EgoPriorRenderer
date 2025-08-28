@@ -75,7 +75,7 @@ class SLAMFrontend:
         self.video.poses[self.t1] = (SE3.exp(w) * p2).data
         # self.video.poses[self.t1] = self.video.poses[self.t1 - 1].clone()
 
-    def __update(self):
+    def __update(self, optimize_poses: bool = True):
         """add edges, perform update"""
 
         self.t1 += 1
@@ -97,8 +97,9 @@ class SLAMFrontend:
             remove=True,
         )
 
-        for _ in range(self.iters1):
-            self.graph.update(use_inactive=True, fixed_motion=self.has_init_pose)
+        if optimize_poses:
+            for _ in range(self.iters1):
+                self.graph.update(use_inactive=True, fixed_motion=self.has_init_pose)
 
         # remove frame t1-2 if it is too close to t1-3, so the new keyframes will be [t1-3, t1-1]
         d = self.video.frame_distance_dense_disp(
@@ -111,34 +112,50 @@ class SLAMFrontend:
             self.graph.rm_second_newest_keyframe(self.t1 - 2)
             self.t1 -= 1
         else:
-            for _ in range(self.iters2):
-                self.graph.update(use_inactive=True, fixed_motion=self.has_init_pose)
+            if optimize_poses:
+                for _ in range(self.iters2):
+                    self.graph.update(use_inactive=True, fixed_motion=self.has_init_pose)
 
-        # set pose for next itration
-        if not self.has_init_pose:
+        # set pose for next iteration
+        if optimize_poses and not self.has_init_pose:
             self.__init_pose()
+        elif not optimize_poses:
+            # Set all poses to first frame's pose
+            first_frame_pose = self.video.poses[0].clone()
+            for i in range(self.t1 + 1):
+                if i < self.video.poses.shape[0]:
+                    self.video.poses[i] = first_frame_pose.clone()
+                    
         for v in range(self.video.n_views):
             self.video.disps[self.t1, v] = self.video.disps[self.t1 - 1, v].mean()
 
         # update visualization
         self.video.dirty[self.graph.ii.min() : self.t1] = True
 
-    def __initialize(self):
+    def __initialize(self, optimize_poses: bool = True):
         """initialize the SLAM system with keyframes idx [t0, t1)"""
 
         self.t1 = self.video.n_frames
 
-        self.graph.add_neighborhood_factors(0, self.t1, r=1 if self.args.seq_init else 3)
-        for _ in range(8):
-            self.graph.update(t0=1, use_inactive=True, fixed_motion=self.has_init_pose)
+        if optimize_poses:
+            self.graph.add_neighborhood_factors(0, self.t1, r=1 if self.args.seq_init else 3)
 
-        if not self.args.seq_init:
+        if not self.args.seq_init and optimize_poses:
             self.graph.add_proximity_factors(0, 0, rad=2, nms=2, thresh=self.frontend_thresh, remove=False)
+        
+        if optimize_poses:
             for _ in range(8):
                 self.graph.update(t0=1, use_inactive=True, fixed_motion=self.has_init_pose)
 
-        if not self.has_init_pose:
+        if optimize_poses and not self.has_init_pose:
             self.__init_pose()
+        elif not optimize_poses:
+            # Set all poses to first frame's pose
+            first_frame_pose = self.video.poses[0].clone()
+            for i in range(self.t1 + 1):
+                if i < self.video.poses.shape[0]:
+                    self.video.poses[i] = first_frame_pose.clone()
+                    
         for v in range(self.video.n_views):
             self.video.disps[self.t1, v] = self.video.disps[self.t1 - 4 : self.t1, v].mean()
         self.video.dirty[: self.t1] = True
@@ -147,13 +164,13 @@ class SLAMFrontend:
         self.is_initialized = True
         self.graph.rm_factors(self.graph.ii < self.warmup - 4, store=True)
 
-    def run(self):
+    def run(self, optimize_poses: bool = True):
         """main update"""
 
         # do initialization
         if not self.is_initialized and self.video.n_frames == self.warmup:
-            self.__initialize()
+            self.__initialize(optimize_poses)
 
         # do update if new keyframe is added.
         elif self.is_initialized and self.t1 < self.video.n_frames:
-            self.__update()
+            self.__update(optimize_poses)

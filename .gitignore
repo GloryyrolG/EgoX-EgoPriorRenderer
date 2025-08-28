@@ -167,3 +167,7 @@ vipe_results/
 /try_*.py
 /external/
 JIAHUI.md
+
+
+# ego view render results
+ego_view_rendering/

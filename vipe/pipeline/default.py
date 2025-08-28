@@ -44,13 +44,28 @@ logger = logging.getLogger(__name__)
 
 
 class DefaultAnnotationPipeline(Pipeline):
-    def __init__(self, init: DictConfig, slam: DictConfig, post: DictConfig, output: DictConfig) -> None:
+    def __init__(self, init: DictConfig, slam: DictConfig, post: DictConfig, output: DictConfig, assume_fixed_camera_pose: bool = False) -> None:
         super().__init__()
         self.init_cfg = init
         self.slam_cfg = slam
         self.post_cfg = post
         self.out_cfg = output
-        self.out_path = Path(self.out_cfg.path)
+        self.assume_fixed_camera_pose = assume_fixed_camera_pose
+        
+        # Modify output path based on depth_align_model
+        output_path = Path(self.out_cfg.path)
+        depth_align_model = self.post_cfg.depth_align_model
+
+        if depth_align_model == "adaptive_unidepth-l_vda":
+            output_path = output_path.parent / f"{output_path.name}_static_vda"
+        elif depth_align_model == "adaptive_unidepth-l":
+            output_path = output_path.parent / f"{output_path.name}_no_vda"
+        
+        if self.assume_fixed_camera_pose:
+            # Add _fixedcam suffix to the output directory name
+            output_path = output_path.parent / (output_path.name + "_fixedcam")
+        
+        self.out_path = output_path
         self.out_path.mkdir(exist_ok=True, parents=True)
         self.camera_type = CameraType(self.init_cfg.camera_type)
 
@@ -109,16 +124,23 @@ class DefaultAnnotationPipeline(Pipeline):
             return annotate_output
 
         slam_streams: list[VideoStream] = [
+            # GeoCalibIntrinsicsProcessor로 초기 intrinsics 추정
             self._add_init_processors(video_stream).cache("process", online=True) for video_stream in video_streams
         ]
 
         slam_pipeline = SLAMSystem(device=torch.device("cuda"), config=self.slam_cfg)
-        slam_output = slam_pipeline.run(slam_streams, rig=slam_rig, camera_type=self.camera_type)
+        slam_output = slam_pipeline.run(slam_streams, rig=slam_rig, camera_type=self.camera_type, camera_fix=self.assume_fixed_camera_pose)
 
         if self.return_payload:
             annotate_output.payload = slam_output
             return annotate_output
 
+        #AssignAttributesProcessor: SLAM 결과를 각 프레임에 할당
+        # 카메라 포즈 (6DOF 변환 행렬)
+        # 카메라 내재 파라미터
+        # AdaptiveDepthProcessor: 적응형 깊이 정렬
+        # SVDA (Supervised Video Depth Alignment) 모델 사용
+        # 메트릭 스케일 복구
         output_streams = [
             self._add_post_processors(view_idx, slam_stream, slam_output).cache("depth", online=True)
             for view_idx, slam_stream in enumerate(slam_streams)
