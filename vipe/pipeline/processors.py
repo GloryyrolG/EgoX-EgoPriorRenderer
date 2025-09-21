@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 from vipe.priors.depth import DepthEstimationInput, make_depth_model
-from vipe.priors.depth.alignment import align_inv_depth_to_depth
+from vipe.priors.depth.alignment import align_inv_depth_to_depth, align_metric_depth_to_depth
 from vipe.priors.depth.priorda import PriorDAModel
 from vipe.priors.depth.videodepthanything import VdieoDepthAnythingDepthModel
 from vipe.priors.geocalib import GeoCalib
@@ -166,13 +166,19 @@ class AdaptiveDepthProcessor(StreamProcessor):
 
         try:
             prefix, metric_model, video_model = model.split("_")
-            assert video_model in ["svda", "vda"]
-            self.video_depth_model = VdieoDepthAnythingDepthModel(model="vits" if video_model == "svda" else "vitl")
+            assert video_model in ["svda", "vda", "metric-vda"]
+            if video_model == "metric-vda":
+                self.video_depth_model = VdieoDepthAnythingDepthModel(model="mvitl")
+                self.is_metric_video = True
+            else:
+                self.video_depth_model = VdieoDepthAnythingDepthModel(model="vits" if video_model == "svda" else "vitl")
+                self.is_metric_video = False
 
         except ValueError:
             prefix, metric_model = model.split("_")
             video_model = None
             self.video_depth_model = None
+            self.is_metric_video = False
 
         assert prefix == "adaptive", "Model name should start with 'adaptive_'"
 
@@ -201,9 +207,11 @@ class AdaptiveDepthProcessor(StreamProcessor):
             frame_data_list.append(frame.cpu())
             frame_list.append(frame.rgb.cpu().numpy())
 
-        video_depth_result: torch.Tensor = unpack_optional(
-            self.video_depth_model.estimate(DepthEstimationInput(video_frame_list=frame_list)).relative_inv_depth
-        )
+        estimation_result = self.video_depth_model.estimate(DepthEstimationInput(video_frame_list=frame_list))
+        if self.is_metric_video:
+            video_depth_result: torch.Tensor = unpack_optional(estimation_result.metric_depth)
+        else:
+            video_depth_result: torch.Tensor = unpack_optional(estimation_result.relative_inv_depth)
         return video_depth_result, frame_data_list
 
     def update_iterator(self, previous_iterator: Iterator[VideoFrame]) -> Iterator[VideoFrame]:
@@ -242,12 +250,21 @@ class AdaptiveDepthProcessor(StreamProcessor):
 
                 logger.info(f"Minimum UV score: {min_uv_score:.4f}")
 
-            if min_uv_score < 0.3:
+                # Decide once whether SLAM map is good enough and log the decision.
+                self._use_slam_prompt = min_uv_score >= 0.3
+                if self._use_slam_prompt:
+                    logger.info(f"SLAM map will be used as prompt (min_uv_score={min_uv_score:.4f}).")
+                else:
+                    logger.info(f"SLAM map NOT used as prompt; falling back to metric model (min_uv_score={min_uv_score:.4f}).")
+
+            # Use the previously decided flag for clarity and stable logging
+            if not getattr(self, "_use_slam_prompt", False):
                 focal_length = frame.intrinsics[0].item()
                 prompt_result = self.depth_model.estimate(
                     DepthEstimationInput(rgb=frame.rgb.float().cuda(), focal_length=focal_length)
                 ).metric_depth
                 frame.information = f"uv={min_uv_score:.2f}(Metric)"
+                logger.debug(f"Frame {frame_idx}: using metric depth prompt (uv={min_uv_score:.4f}).")
             else:
                 depth_map = self.slam_output.slam_map.project_map(
                     frame_idx,
@@ -267,33 +284,61 @@ class AdaptiveDepthProcessor(StreamProcessor):
                     )
                 ).metric_depth
                 frame.information = f"uv={min_uv_score:.2f}(SLAM)"
+                logger.debug(f"Frame {frame_idx}: using SLAM-prompted PriorDA (uv={min_uv_score:.4f}).")
 
             if video_depth_result is not None:
-                video_depth_inv_depth = video_depth_result[frame_idx]
+                if self.is_metric_video:
+                    # For metric video depth models, align metric depth to depth
+                    video_depth = video_depth_result[frame_idx]
+                    
+                    align_mask = video_depth > 1e-3
+                    if frame.mask is not None:
+                        align_mask = align_mask & frame.mask & (~frame.sky_mask)
 
-                align_mask = video_depth_inv_depth > 1e-3
-                if frame.mask is not None:
-                    align_mask = align_mask & frame.mask & (~frame.sky_mask)
+                    try:
+                        aligned_depth, scale, bias = align_metric_depth_to_depth(
+                            video_depth,
+                            prompt_result,
+                            align_mask,
+                        )
+                        
+                        # momentum update for metric video models
+                        if self.cache_scale_bias is None:
+                            self.cache_scale_bias = (scale, bias)
+                        scale = self.cache_scale_bias[0] * self.update_momentum + scale * (1 - self.update_momentum)
+                        bias = self.cache_scale_bias[1] * self.update_momentum + bias * (1 - self.update_momentum)
+                        self.cache_scale_bias = (scale, bias)
+                        
+                        frame.metric_depth = aligned_depth
+                    except RuntimeError:
+                        # Fallback to video depth if alignment fails
+                        frame.metric_depth = video_depth
+                else:
+                    video_depth_inv_depth = video_depth_result[frame_idx]
 
-                try:
-                    _, scale, bias = align_inv_depth_to_depth(
-                        unpack_optional(video_depth_inv_depth),
-                        prompt_result,
-                        align_mask,
-                    )
-                except RuntimeError:
-                    scale, bias = self.cache_scale_bias
+                    align_mask = video_depth_inv_depth > 1e-3
+                    if frame.mask is not None:
+                        align_mask = align_mask & frame.mask & (~frame.sky_mask)
 
-                # momentum update
-                if self.cache_scale_bias is None:
+                    try:
+                        _, scale, bias = align_inv_depth_to_depth(
+                            unpack_optional(video_depth_inv_depth),
+                            prompt_result,
+                            align_mask,
+                        )
+                    except RuntimeError:
+                        scale, bias = self.cache_scale_bias
+
+                    # momentum update
+                    if self.cache_scale_bias is None:
+                        self.cache_scale_bias = (scale, bias)
+                    scale = self.cache_scale_bias[0] * self.update_momentum + scale * (1 - self.update_momentum)
+                    bias = self.cache_scale_bias[1] * self.update_momentum + bias * (1 - self.update_momentum)
                     self.cache_scale_bias = (scale, bias)
-                scale = self.cache_scale_bias[0] * self.update_momentum + scale * (1 - self.update_momentum)
-                bias = self.cache_scale_bias[1] * self.update_momentum + bias * (1 - self.update_momentum)
-                self.cache_scale_bias = (scale, bias)
 
-                video_inv_depth = video_depth_inv_depth * scale + bias
-                video_inv_depth[video_inv_depth < 1e-3] = 1e-3
-                frame.metric_depth = video_inv_depth.reciprocal()
+                    video_inv_depth = video_depth_inv_depth * scale + bias
+                    video_inv_depth[video_inv_depth < 1e-3] = 1e-3
+                    frame.metric_depth = video_inv_depth.reciprocal()
 
             else:
                 frame.metric_depth = prompt_result

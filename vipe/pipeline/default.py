@@ -60,10 +60,15 @@ class DefaultAnnotationPipeline(Pipeline):
             output_path = output_path.parent / f"{output_path.name}_static_vda"
         elif depth_align_model == "adaptive_unidepth-l":
             output_path = output_path.parent / f"{output_path.name}_no_vda"
-        
+        elif depth_align_model == "adaptive_unidepth-l_metric-vda":
+            output_path = output_path.parent / f"{output_path.name}_metric_vda"
+
+        # Add _fixedcam suffix to the output directory name
         if self.assume_fixed_camera_pose:
-            # Add _fixedcam suffix to the output directory name
             output_path = output_path.parent / (output_path.name + "_fixedcam")
+        # Add _slammap suffix when save_slam_map is enabled in output config
+        if getattr(self.out_cfg, "save_slam_map", False):
+            output_path = output_path.parent / (output_path.name + "_slammap")
         
         self.out_path = output_path
         self.out_path.mkdir(exist_ok=True, parents=True)

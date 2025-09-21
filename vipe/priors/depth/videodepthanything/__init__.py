@@ -41,6 +41,11 @@ class VdieoDepthAnythingDepthModel(DepthEstimationModel):
                 "features": 256,
                 "out_channels": [256, 512, 1024, 1024],
             },
+            "mvitl": {
+                "encoder": "vitl",
+                "features": 256,
+                "out_channels": [256, 512, 1024, 1024],
+            },
         }[model]
 
         self.is_metric = False
@@ -50,6 +55,10 @@ class VdieoDepthAnythingDepthModel(DepthEstimationModel):
         elif model == "vitl":
             self.ckpt_url = "https://huggingface.co/depth-anything/Video-Depth-Anything-Large/resolve/main/video_depth_anything_vitl.pth"
             self.use_fp32 = False
+        elif model == "mvitl":
+            self.ckpt_url = "https://huggingface.co/depth-anything/Metric-Video-Depth-Anything-Large/resolve/main/metric_video_depth_anything_vitl.pth"
+            self.use_fp32 = False
+            self.is_metric = True
         else:
             raise ValueError(f"Model {model} not supported")
 
@@ -64,10 +73,15 @@ class VdieoDepthAnythingDepthModel(DepthEstimationModel):
 
     @property
     def depth_type(self) -> DepthType:
+        if self.is_metric:
+            return DepthType.METRIC_DEPTH
         return DepthType.AFFINE_DISP
 
     def estimate(self, src: DepthEstimationInput) -> DepthEstimationResult:
         frame_list: list[np.ndarray] = unpack_optional(src.video_frame_list)
         depths = self.model.infer_video_depth(frame_list, input_size=self.input_size, fp32=self.use_fp32)  # [T, H, W]
         depths = torch.from_numpy(depths).float().cuda()
-        return DepthEstimationResult(relative_inv_depth=depths)
+        if self.is_metric:
+            return DepthEstimationResult(metric_depth=depths)
+        else:
+            return DepthEstimationResult(relative_inv_depth=depths)

@@ -36,16 +36,34 @@ from vipe.utils.viser import run_viser
 )
 @click.option("--pipeline", "-p", default="default", help="Pipeline configuration to use (default: 'default')")
 @click.option("--visualize", "-v", is_flag=True, help="Enable visualization of intermediate results")
-@click.option("--num_frame", "-n", type=int, default=None, help="Number of frames to process from the beginning of the video")
+@click.option("--start_frame", type=int, default=0, help="Starting frame number (default: 0)")
+@click.option("--end_frame", type=int, default=None, help="Ending frame number (inclusive, default: process all frames)")
 @click.option("--assume_fixed_camera_pose", is_flag=True, help="Assume camera pose is fixed throughout the video (skips SLAM pose estimation)")
-def infer(video: Path, output: Path, pipeline: str, visualize: bool, num_frame: int, assume_fixed_camera_pose: bool):
+def infer(video: Path, output: Path, pipeline: str, visualize: bool, start_frame: int, end_frame: int, assume_fixed_camera_pose: bool):
     """Run inference on a video file."""
 
     logger = configure_logging()
 
     # Create output directory based on video name
     video_name = video.stem  # Get filename without extension
-    video_output_path = output / video_name
+    
+    # Extract dataset directory from video path for better organization
+    university_names = ["cmu", "fair", "georgiatech", "iiith", "indiana", "minnesota", "nus", "sfu", "unc", "uniandes", "upenn", "utokyo"]
+    dataset_dir = None
+    
+    for parent in video.parents:
+        parent_name_lower = parent.name.lower()
+        for university in university_names:
+            if university in parent_name_lower:
+                dataset_dir = parent.name
+                break
+        if dataset_dir:
+            break
+    
+    if dataset_dir:
+        video_output_path = output / dataset_dir / video_name
+    else:
+        video_output_path = output / video_name
     
     overrides = [f"pipeline={pipeline}", f"pipeline.output.path={video_output_path}", "pipeline.output.save_artifacts=true"]
     if visualize:
@@ -66,14 +84,21 @@ def infer(video: Path, output: Path, pipeline: str, visualize: bool, num_frame: 
     vipe_pipeline = make_pipeline(args.pipeline)
 
     # Some input videos can be malformed, so we need to cache the videos to obtain correct number of frames.
-    # Apply frame limit if specified
-    if num_frame is not None:
-        seek_range = range(0, num_frame)
+    # Apply frame range if specified
+    if end_frame is not None:
+        seek_range = range(start_frame, end_frame + 1)  # +1 to make end_frame inclusive
         video_stream = ProcessedVideoStream(RawMp4Stream(video, seek_range=seek_range), []).cache(desc="Reading video stream")
-        logger.info(f"Processing only first {num_frame} frames")
+        logger.info(f"Processing frames {start_frame} to {end_frame} ({end_frame - start_frame + 1} frames)")
+    elif start_frame > 0:
+        # If only start_frame is specified, process from start_frame to end
+        video_stream = ProcessedVideoStream(RawMp4Stream(video), []).cache(desc="Reading video stream")
+        total_frames = len(video_stream)
+        seek_range = range(start_frame, total_frames)
+        video_stream = ProcessedVideoStream(RawMp4Stream(video, seek_range=seek_range), []).cache(desc="Reading video stream")
+        logger.info(f"Processing frames {start_frame} to {total_frames-1} ({total_frames - start_frame} frames)")
     else:
         video_stream = ProcessedVideoStream(RawMp4Stream(video), []).cache(desc="Reading video stream")
-        logger.info(f"Processing all {len(video_stream)} frames")
+        logger.info(f"Processing all {len(video_stream)} frames (0 to {len(video_stream)-1})")
 
     vipe_pipeline.run(video_stream)
     logger.info("Finished")
@@ -82,8 +107,9 @@ def infer(video: Path, output: Path, pipeline: str, visualize: bool, num_frame: 
 @click.command()
 @click.argument("data_path", type=click.Path(exists=True, path_type=Path), default=Path.cwd() / "vipe_results")
 @click.option("--port", "-p", default=20540, type=int, help="Port for the visualization server (default: 20540)")
-def visualize(data_path: Path, port: int):
-    run_viser(data_path, port)
+@click.option("--use_mean_bg", is_flag=True, help="Use robust statistical mean background instead of standard background")
+def visualize(data_path: Path, port: int, use_mean_bg: bool):
+    run_viser(data_path, port, use_mean_bg)
 
 
 @click.group()

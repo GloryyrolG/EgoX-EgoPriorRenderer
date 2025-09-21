@@ -42,7 +42,7 @@ output:
   save_artifacts: false
 
   # Save reconstruction from SLAM
-  save_slam_map: false
+  save_slam_map: true # default: false
 
   # Visualization videos to BASE_PATH/vipe/xxx.mp4
   save_viz: true

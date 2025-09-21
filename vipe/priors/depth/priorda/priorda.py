@@ -80,7 +80,7 @@ class PriorDepthAnything(nn.Module):
         self.sampler = SparseSampler(device=device)
 
     def load_checkpoints(self, model, ckpt_dir, device="cuda:0"):
-        ckpt_name = f"prior_depth_anything_{self.args.conditioned_model_size}.pth"
+        ckpt_name = f"prior_depth_anything_{self.args.conditioned_model_size}_1_1.pth" # ver 1.1 updated 25.08.30
         if ckpt_dir is None:
             ckpt_path = hf_hub_download(repo_id=self.args.repo_name, filename=ckpt_name)
         else:

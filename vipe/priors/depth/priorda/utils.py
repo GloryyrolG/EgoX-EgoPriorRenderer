@@ -15,7 +15,7 @@ from PIL import Image
 class Arguments:
     K: int = field(default=5, metadata={"help": "K value of KNN"})
     conditioned_model_size: str = field(default="vitb", metadata={"help": "Size of conditioned model."})
-    frozen_model_size: str = field(default="vitb", metadata={"help": "Size of frozen model."})
+    frozen_model_size: str = field(default="vitl", metadata={"help": "Size of frozen model."})
     normalize_depth: bool = field(default=True, metadata={"help": "Whether to normalize depth."})
     normalize_confidence: bool = field(default=True, metadata={"help": "Whether to normalize confidence."})
     err_condition: bool = field(default=True, metadata={"help": "Whether to use confidence/error as condition."})

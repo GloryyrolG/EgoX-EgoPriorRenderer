@@ -18,6 +18,7 @@ import asyncio
 import logging
 import socket
 import time
+from typing import Tuple, List
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,9 +54,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def compute_robust_mean_tensors(stacked_depth: torch.Tensor, stacked_rgb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    GPU 벡터화된 버전: 픽셀별 NaN-aware 평균을 병렬로 계산.
+    """
+    logger.info("Computing mean background using nanmean with GPU vectorization...")
+    
+    # NaN을 무시하고 평균 계산
+    robust_depth = torch.nanmean(stacked_depth, dim=0)
+    robust_rgb = torch.nanmean(stacked_rgb, dim=0)
+    
+    # NaN 값들을 0으로 대체
+    robust_depth = torch.nan_to_num(robust_depth, nan=0.0)
+    robust_rgb = torch.nan_to_num(robust_rgb, nan=0.0)
+    
+    return robust_depth, robust_rgb
+
+
 @dataclass
 class GlobalContext:
     artifacts: list[ArtifactPath]
+    use_mean_bg: bool = False
+    mean_depth: torch.Tensor = None
+    mean_rgb: torch.Tensor = None
+    
+    def __post_init__(self):
+        # dataclass에서 None으로 초기화된 tensor 필드들 처리
+        if self.mean_depth is None:
+            self.mean_depth = None
+        if self.mean_rgb is None:
+            self.mean_rgb = None
 
 
 _global_context: GlobalContext | None = None
@@ -66,6 +94,7 @@ class SceneFrameHandle:
     frame_handle: viser.FrameHandle
     frustum_handle: viser.CameraFrustumHandle
     pcd_handle: viser.PointCloudHandle | None = None
+    dynamic_pcd_handle: viser.PointCloudHandle | None = None
 
     def __post_init__(self):
         self.visible = False
@@ -80,6 +109,176 @@ class SceneFrameHandle:
         self.frustum_handle.visible = value
         if self.pcd_handle is not None:
             self.pcd_handle.visible = value
+        # Dynamic point cloud는 추가적으로 show_dynamic_objects 설정도 고려
+        if self.dynamic_pcd_handle is not None:
+            # ClientClosures instance에 접근하기 위해 여기서는 단순히 value만 사용
+            # GUI 상태는 GUI 컨트롤의 on_update에서 처리
+            self.dynamic_pcd_handle.visible = value
+
+
+def compute_mean_background_depth(artifact_path: ArtifactPath, 
+                                  spatial_subsample: int = 2, max_frames: int = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    모든 프레임에서 background depth와 RGB의 nanmean을 미리 계산.
+    """
+    logger.info("Computing mean background depth using nanmean...")
+    
+    # GPU device 설정
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    def none_it(inner_it):
+        try:
+            for item in inner_it:
+                yield item
+        except FileNotFoundError:
+            while True:
+                yield None, None
+
+    def none_it_mask(inner_it):
+        try:
+            for item in inner_it:
+                yield item
+        except FileNotFoundError:
+            while True:
+                yield None, None
+
+    valid_depth_frames = []
+    valid_rgb_frames = []
+    frame_count = 0
+
+    for frame_idx, ((_, rgb), (_, depth), (_, instance_mask)) in enumerate(
+        zip(
+            read_rgb_artifacts(artifact_path.rgb_path),
+            none_it(read_depth_artifacts(artifact_path.depth_path)),
+            none_it_mask(read_instance_artifacts(artifact_path.mask_path)),
+        )
+    ):
+        if depth is None:
+            continue
+        
+        if max_frames and frame_count >= max_frames:
+            break
+
+        # GPU로 이동
+        rgb = rgb.to(device)
+        depth = depth.to(device)
+        if instance_mask is not None:
+            instance_mask = instance_mask.to(device)
+
+        # Background만 유지 (instance_id == 0)
+        if instance_mask is not None:
+            static_mask = (instance_mask == 0)
+        else:
+            static_mask = torch.ones_like(depth, dtype=torch.bool, device=device)
+        
+        # 유효한 depth 마스크
+        depth_mask = reliable_depth_mask_range(depth)
+        final_mask = static_mask & depth_mask
+
+        # 무효한 픽셀을 NaN으로 설정
+        masked_depth = depth.clone().float()
+        masked_depth[~final_mask] = float('nan')
+        
+        masked_rgb = rgb.clone().float()
+        masked_rgb[~final_mask.unsqueeze(-1).expand_as(rgb)] = float('nan')
+
+        # Spatial subsampling 적용
+        if spatial_subsample > 1:
+            masked_depth = masked_depth[::spatial_subsample, ::spatial_subsample]
+            masked_rgb = masked_rgb[::spatial_subsample, ::spatial_subsample]
+
+        valid_depth_frames.append(masked_depth)
+        valid_rgb_frames.append(masked_rgb)
+        
+        frame_count += 1
+        if frame_idx % 10 == 0:
+            logger.info(f"Processed frame {frame_idx} for mean background computation.")
+
+    if not valid_depth_frames:
+        logger.warning("No valid background frames found.")
+        return None, None
+
+    logger.info(f"Computing nanmean from {len(valid_depth_frames)} frames...")
+    
+    stacked_depth = torch.stack(valid_depth_frames, dim=0)  # [N_frames, H, W]
+    stacked_rgb = torch.stack(valid_rgb_frames, dim=0)      # [N_frames, H, W, 3]
+    
+    # Nanmean 계산
+    mean_depth, mean_rgb = compute_robust_mean_tensors(stacked_depth, stacked_rgb)
+    
+    logger.info(f"Mean background depth computed: {mean_depth.shape}, device: {mean_depth.device}")
+    return mean_depth, mean_rgb
+
+
+def build_dynamic_points_for_frame(artifact_path: ArtifactPath, frame_idx: int, c2w: np.ndarray, 
+                                   rgb: torch.Tensor, depth: torch.Tensor, instance_mask: torch.Tensor,
+                                   camera_type: CameraType, intr: torch.Tensor, spatial_subsample: int = 2) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    특정 프레임에서 dynamic objects (instance_id != 0)의 point cloud를 생성.
+    
+    Args:
+        artifact_path: ViPE artifact path
+        frame_idx: Frame index
+        c2w: Camera-to-world transformation matrix
+        rgb: RGB image tensor
+        depth: Depth tensor
+        instance_mask: Instance segmentation mask
+        camera_type: Camera type
+        intr: Camera intrinsics
+        spatial_subsample: Spatial subsampling factor
+        
+    Returns:
+        dynamic_points: Nx3 array of 3D points (camera coordinates)
+        dynamic_colors: Nx3 array of RGB colors (0-255)
+    """
+    if depth is None or instance_mask is None:
+        return np.empty((0, 3)), np.empty((0, 3))
+
+    frame_height, frame_width = rgb.shape[:2]
+
+    # RGB 처리
+    sampled_rgb = (rgb.cpu().numpy() * 255).astype(np.uint8)
+    sampled_rgb = sampled_rgb[::spatial_subsample, ::spatial_subsample]
+
+    # Ray 생성
+    camera_model = camera_type.build_camera_model(intr)
+    disp_v, disp_u = torch.meshgrid(
+        torch.arange(frame_height).float()[::spatial_subsample],
+        torch.arange(frame_width).float()[::spatial_subsample],
+        indexing="ij",
+    )
+    if camera_type == CameraType.PANORAMA:
+        disp_v = disp_v / (frame_height - 1)
+        disp_u = disp_u / (frame_width - 1)
+    disp = torch.ones_like(disp_v)
+    pts, _, _ = camera_model.iproj_disp(disp, disp_u, disp_v)
+    rays = pts[..., :3].numpy()
+    if camera_type != CameraType.PANORAMA:
+        rays /= rays[..., 2:3]
+
+    # Point cloud 생성 (카메라 좌표계)
+    pcd_camera = rays * depth.numpy()[::spatial_subsample, ::spatial_subsample, None]
+    
+    # Depth mask 적용
+    depth_mask = reliable_depth_mask_range(depth)[::spatial_subsample, ::spatial_subsample].numpy()
+
+    # Dynamic objects만 유지 (instance_id != 0)
+    instance_mask_np = instance_mask.cpu().numpy() if hasattr(instance_mask, 'cpu') else instance_mask
+    dynamic_mask = (instance_mask_np != 0)
+    dynamic_mask_sub = dynamic_mask[::spatial_subsample, ::spatial_subsample]
+    final_mask = depth_mask & dynamic_mask_sub
+
+    # Flatten and filter
+    pcd_flat = pcd_camera.reshape(-1, 3)
+    rgb_flat = sampled_rgb.reshape(-1, 3)
+    mask_flat = final_mask.reshape(-1)
+
+    valid_points = pcd_flat[mask_flat]
+    valid_colors = rgb_flat[mask_flat]
+
+    logger.info(f"Frame {frame_idx}: Generated {len(valid_points)} dynamic points")
+    
+    return valid_points, valid_colors
 
 
 class ClientClosures:
@@ -151,6 +350,8 @@ class ClientClosures:
                 for frame_node in self.scene_frame_handles:
                     if frame_node.pcd_handle is not None:
                         frame_node.pcd_handle.point_size = self.gui_point_size.value
+                    if frame_node.dynamic_pcd_handle is not None:
+                        frame_node.dynamic_pcd_handle.point_size = self.gui_point_size.value * 1.2
 
             self.gui_frustum_size = self.client.gui.add_slider(
                 "Frustum size", min=0.01, max=0.5, step=0.01, initial_value=0.15
@@ -180,6 +381,20 @@ class ClientClosures:
             @self.gui_filter_dynamic_objects.on_update
             async def _(_) -> None:
                 await self.on_sample_update(None)
+
+            # Dynamic objects 표시 컨트롤 추가
+            self.gui_show_dynamic_objects = self.client.gui.add_checkbox(
+                "Show Dynamic Objects",
+                initial_value=True,
+                hint="Show dynamic objects (people, cars, etc.) as separate point cloud"
+            )
+
+            @self.gui_show_dynamic_objects.on_update
+            async def _(_) -> None:
+                # Dynamic point clouds의 visibility 토글
+                for frame_node in self.scene_frame_handles:
+                    if frame_node.dynamic_pcd_handle is not None:
+                        frame_node.dynamic_pcd_handle.visible = self.gui_show_dynamic_objects.value and frame_node.visible
 
             self.gui_fov = self.client.gui.add_slider("FoV", min=30.0, max=120.0, step=1.0, initial_value=60.0)
 
@@ -232,6 +447,9 @@ class ClientClosures:
         current_artifact = self.global_context().artifacts[self.gui_id.value]
         spatial_subsample: int = self.gui_s_sub.value
         temporal_subsample: int = self.gui_t_sub.value
+        
+        # GlobalContext에서 설정값 가져오기
+        use_mean_bg = self.global_context().use_mean_bg
 
         rays: np.ndarray | None = None
         first_frame_y: np.ndarray | None = None
@@ -239,6 +457,16 @@ class ClientClosures:
         self.client.scene.reset()
         self.client.camera.fov = np.deg2rad(self.gui_fov.value)
         self.scene_frame_handles = []
+        
+        # Mean background depth 계산 (use_mean_bg가 true이고 아직 계산되지 않은 경우)
+        if use_mean_bg and (self.global_context().mean_depth is None or self.global_context().mean_rgb is None):
+            logger.info("Computing mean background depth for the first time...")
+            mean_depth, mean_rgb = compute_mean_background_depth(
+                current_artifact, spatial_subsample
+            )
+            # GlobalContext에 저장
+            self.global_context().mean_depth = mean_depth
+            self.global_context().mean_rgb = mean_rgb
 
         def none_it(inner_it):
             try:
@@ -273,8 +501,11 @@ class ClientClosures:
             frame_height, frame_width = rgb.shape[:2]
             fov = 2 * np.arctan2(frame_height / 2, pinhole_intr[0].item())
 
-            sampled_rgb = (rgb.cpu().numpy() * 255).astype(np.uint8)
-            sampled_rgb = sampled_rgb[::spatial_subsample, ::spatial_subsample]
+            # RGB 처리 - use_mean_bg에 따라 다른 RGB 사용
+            if not (use_mean_bg and self.global_context().mean_rgb is not None):
+                # 일반적인 프레임별 RGB 사용
+                sampled_rgb = (rgb.cpu().numpy() * 255).astype(np.uint8)
+                sampled_rgb = sampled_rgb[::spatial_subsample, ::spatial_subsample]
 
             if first_frame_y is None:
                 first_frame_y = c2w[:3, 1]
@@ -296,8 +527,42 @@ class ClientClosures:
                 if camera_type != CameraType.PANORAMA:
                     rays /= rays[..., 2:3]
 
-            if depth is not None:
-                # 원래 코드 (카메라 좌표계)
+            # Point cloud 처리 - use_mean_bg에 따라 다른 방식 사용
+            dynamic_pcd = None
+            dynamic_colors = None
+            
+            if use_mean_bg and self.global_context().mean_depth is not None:
+                # Mean background depth 사용
+                logger.info(f"Frame {frame_idx}: Using pre-computed mean background depth with nanmean")
+                
+                # GPU tensor를 numpy로 변환
+                mean_depth_np = self.global_context().mean_depth.cpu().numpy()
+                mean_rgb_np = self.global_context().mean_rgb.cpu().numpy()
+                
+                # Background point cloud 계산 (mean depth 사용)
+                pcd = rays * mean_depth_np[..., None]
+                
+                # Mean depth에서 유효한 픽셀 마스크 (0이 아닌 값들)
+                depth_mask = mean_depth_np > 0
+                
+                # RGB 색상도 mean RGB 사용 (0-255 범위로 변환)
+                sampled_rgb = (mean_rgb_np * 255).astype(np.uint8)
+                
+                # Dynamic objects 추가 (현재 프레임의 실제 depth 사용)
+                show_dynamic = True  # 기본값
+                if hasattr(self, 'gui_show_dynamic_objects') and self.gui_show_dynamic_objects is not None:
+                    show_dynamic = self.gui_show_dynamic_objects.value
+                
+                if depth is not None and instance_mask is not None and show_dynamic:
+                    dynamic_pcd, dynamic_colors = build_dynamic_points_for_frame(
+                        current_artifact, frame_idx, c2w, rgb, depth, instance_mask, 
+                        camera_type, intr, spatial_subsample
+                    )
+                
+                logger.info(f"Frame {frame_idx}: Using mean background with {np.sum(depth_mask)} background points + {len(dynamic_pcd) if dynamic_pcd is not None else 0} dynamic points")
+                
+            elif depth is not None:
+                # 원래 코드 (프레임별 depth 사용)
                 pcd = rays * depth.numpy()[::spatial_subsample, ::spatial_subsample, None]                
                 depth_mask = reliable_depth_mask_range(depth)[::spatial_subsample, ::spatial_subsample].numpy()
                 
@@ -322,6 +587,8 @@ class ClientClosures:
                 fov,
                 pcd,
                 depth_mask,
+                dynamic_pcd,
+                dynamic_colors,
             )
             self.scene_frame_handles.append(frame_node)
 
@@ -333,6 +600,8 @@ class ClientClosures:
         fov: float,
         pcd: np.ndarray | None,
         pcd_mask: np.ndarray | None = None,
+        dynamic_pcd: np.ndarray | None = None,
+        dynamic_colors: np.ndarray | None = None,
     ) -> SceneFrameHandle:
         handle = self.client.scene.add_frame(
             f"/frames/t{frame_idx}",
@@ -353,6 +622,7 @@ class ClientClosures:
             image=np.array(frame_thumbnail),
         )
 
+        # Background point cloud 처리
         if pcd is not None:
             pcd = pcd.reshape(-1, 3)
             rgb = rgb.reshape(-1, 3)
@@ -361,7 +631,7 @@ class ClientClosures:
                 pcd = pcd[pcd_mask]
                 rgb = rgb[pcd_mask]
             pcd_handle = self.client.scene.add_point_cloud(
-                name=f"/frames/t{frame_idx}/point_cloud",
+                name=f"/frames/t{frame_idx}/point_cloud_bg",
                 points=pcd,
                 colors=rgb,
                 point_size=self.gui_point_size.value,
@@ -370,10 +640,26 @@ class ClientClosures:
         else:
             pcd_handle = None
 
+        # Dynamic point cloud 처리
+        dynamic_pcd_handle = None
+        if dynamic_pcd is not None and len(dynamic_pcd) > 0:
+            # Dynamic objects를 카메라 좌표계에서 월드 좌표계로 변환
+            dynamic_world = (c2w[:3, :3] @ dynamic_pcd.T + c2w[:3, 3:4]).T
+            
+            dynamic_pcd_handle = self.client.scene.add_point_cloud(
+                name=f"/frames/t{frame_idx}/point_cloud_dynamic",
+                points=dynamic_world,
+                colors=dynamic_colors,
+                point_size=self.gui_point_size.value * 1.2,  # Dynamic objects를 조금 더 크게
+                point_shape="rounded",
+            )
+            logger.info(f"Frame {frame_idx}: Added {len(dynamic_world)} dynamic points to scene")
+
         return SceneFrameHandle(
             frame_handle=handle,
             frustum_handle=frustum_handle,
             pcd_handle=pcd_handle,
+            dynamic_pcd_handle=dynamic_pcd_handle,
         )
 
     def _incr_timestep(self):
@@ -454,7 +740,7 @@ def get_host_ip() -> str:
     return internal_ip
 
 
-def run_viser(base_path: Path, port: int = 20540):
+def run_viser(base_path: Path, port: int = 20540, use_mean_bg: bool = False):
     # Get list of artifacts.
     logger.info(f"Loading artifacts from {base_path}")
     artifacts: list[ArtifactPath] = list(ArtifactPath.glob_artifacts(base_path, use_video=True))
@@ -463,7 +749,10 @@ def run_viser(base_path: Path, port: int = 20540):
         return
 
     global _global_context
-    _global_context = GlobalContext(artifacts=sorted(artifacts, key=lambda x: x.artifact_name))
+    _global_context = GlobalContext(
+        artifacts=sorted(artifacts, key=lambda x: x.artifact_name),
+        use_mean_bg=use_mean_bg
+    )
 
     # 새 코드: 모든 인터페이스에서 수신 대기
     server = viser.ViserServer(host="0.0.0.0", port=port, verbose=False)
@@ -500,9 +789,14 @@ def main():
         default=20540,
         help="Port number for the viser server.",
     )
+    parser.add_argument(
+        "--use_mean_bg", 
+        action="store_true", 
+        help="Use nanmean background instead of standard background"
+    )
     args = parser.parse_args()
 
-    run_viser(args.base_path, args.port)
+    run_viser(args.base_path, args.port, args.use_mean_bg)
 
 
 if __name__ == "__main__":

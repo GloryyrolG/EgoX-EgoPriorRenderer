@@ -1,3 +1,101 @@
+# Ego View Rendering from ViPE Results
+
+ViPE provides point cloud rendering functionality to visualize the 3D reconstruction results. This is particularly useful for analyzing the spatial structure and quality of the estimated depth maps and camera poses.
+
+### Prerequisites
+
+Before running the rendering commands, ensure you have completed the ViPE inference on your video using the provided script:
+
+```bash
+# First, run ViPE inference using the batch script
+./scripts/infer_vipe.sh
+```
+
+This script will run ViPE inference with the following parameters: `--start_frame`, `--end_frame`, `--assume_fixed_camera_pose`, and `--pipeline` settings. The script generates the necessary pose and depth information in the output directory.
+
+### Rendering with Scripts
+
+For convenient batch processing, use the provided rendering script:
+
+```bash
+./scripts/render_vipe.sh
+```
+
+This script executes the point cloud rendering with multiple parameters configured for Ego4D dataset processing:
+
+- `--input_dir`: ViPE inference results directory
+- `--out_dir`: Output directory for rendered results
+- `--ego_camera_pose_path`: Ego camera pose JSON file
+- `--exo_camera_pose_path`: Exocentric camera calibration CSV
+- `--online_calibration_path`: Online calibration data
+- `--point_size`: Point cloud visualization size
+- `--start_frame`/`--end_frame`: Frame range (both inclusive)
+- `--fish_eye_rendering`: Enables fish-eye distortion rendering
+- `--use_mean_bg`: Uses mean background for rendering
+
+The script also supports multi-GPU parallel processing and can be configured by modifying the experiment settings within the script.
+
+### Manual Rendering Command
+
+For manual execution or custom configurations, you can also run the rendering script directly:
+
+```bash
+python ego_view_rendering/render_vipe_pointcloud.py \
+  --input_dir vipe_results/YOUR_VIDEO_NAME \
+  --start_frame 0 \
+  --end_frame 100 \
+  --out_dir ego_view_rendering \
+  --point_size 1.5 \
+  --fish_eye_rendering \
+  --use_mean_bg
+```
+
+### Output Structure
+
+The rendered results will be saved in the following structure:
+```
+ego_view_rendering/
+├── cmu_bike01_2/
+│   └── cam02/
+│       ├── test_output_pts1.0/
+│       ├── test_output_static_vda_fixedcam_fisheye_pts1.0/
+│       ├── test_output_static_vda_fixedcam_mean_bg_fisheye_pts1.5/
+│       └── test_output_static_vda_fixedcam_slammap_fisheye_pts0.5/
+│       ```
+├── fair_cooking_05_2/
+├── georgiatech_cooking_01_01_2/
+├── iiith_cooking_01_1/
+├── indiana_cooking_01_2/
+├── minnesota_cooking_010_2/
+├── nus_cooking_06_2/
+├── sfu_cooking015_2/
+└── uniandes_cooking_001_10/
+```
+
+Each experiment directory contains multiple output subdirectories with different rendering configurations (pipeline type, point size, background settings, etc.).
+
+### Common Issues and Solutions
+
+**Issue**: `ValueError: No valid camera ID found in directory`
+- **Solution**: Ensure your inference results contain properly formatted camera data, or specify the camera ID explicitly using `--cam_id`
+
+**Issue**: `Frame range [X, Y] exceeds available inference results [0, Z]`
+- **Solution**: Check the available frame range in your inference results and adjust `--start_frame` and `--end_frame` accordingly
+
+**Issue**: Missing pose or depth data
+- **Solution**: Verify that ViPE inference completed successfully and generated all necessary output files (`pose/*.npz`, `depth/*.npy`)
+
+### Performance Tips
+
+- For large videos, consider processing smaller frame ranges to reduce memory usage and processing time
+- The rendering quality depends on the depth estimation quality from the original ViPE inference
+- Use the visualization tools (`vipe visualize`) to preview results before running extensive rendering jobs
+
+<br/><br/><br/>
+
+
+<br/>
+
 # ViPE: Video Pose Engine for Geometric 3D Perception
 
 <p align="center">
