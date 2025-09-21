@@ -32,6 +32,7 @@ This script executes the point cloud rendering with multiple parameters configur
 - `--start_frame`/`--end_frame`: Frame range (both inclusive)
 - `--fish_eye_rendering`: Enables fish-eye distortion rendering
 - `--use_mean_bg`: Uses mean background for rendering
+- `--only_bg`: Renders only the background point clouds (exclude dynamic instance's point clouds)
 
 The script also supports multi-GPU parallel processing and can be configured by modifying the experiment settings within the script.
 
@@ -79,8 +80,8 @@ Each experiment directory contains multiple output subdirectories with different
 **Issue**: `ValueError: No valid camera ID found in directory`
 - **Solution**: Ensure your inference results contain properly formatted camera data, or specify the camera ID explicitly using `--cam_id`
 
-**Issue**: `Frame range [X, Y] exceeds available inference results [0, Z]`
-- **Solution**: Check the available frame range in your inference results and adjust `--start_frame` and `--end_frame` accordingly
+**Issue**: `Frame range [X, Y] exceeds available inference results [START_FRAME, END_FRAME]`
+- **Solution**: Check the available frame range in your inference results (which corresponds to the start_frame and end_frame used during inference) and adjust `--start_frame` and `--end_frame` accordingly
 
 **Issue**: Missing pose or depth data
 - **Solution**: Verify that ViPE inference completed successfully and generated all necessary output files (`pose/*.npz`, `depth/*.npy`)
@@ -109,7 +110,7 @@ Each experiment directory contains multiple output subdirectories with different
 **Full Abstract**: Accurate 3D geometric perception is an important prerequisite for a wide range of spatial AI systems. While state-of-the-art methods depend on large-scale training data, acquiring consistent and precise 3D annotations from in-the-wild videos remains a key challenge. In this work, we introduce ViPE, a handy and versatile video processing engine designed to bridge this gap. ViPE efficiently estimates camera intrinsics, camera motion, and dense, near-metric depth maps from unconstrained raw videos. It is robust to diverse scenarios, including dynamic selfie videos, cinematic shots, or dashcams, and supports various camera models such as pinhole, wide-angle, and 360° panoramas. 
 We use ViPE to annotate a large-scale collection of videos. This collection includes around 100K real-world internet videos, 1M high-quality AI-generated videos, and 2K panoramic videos, totaling approximately 96M frames -- all annotated with accurate camera poses and dense depth maps. We open source ViPE and the annotated dataset with the hope to accelerate the development of spatial AI systems.
 
-**[Technical Whitepaper](https://research.nvidia.com/labs/toronto-ai/vipe/assets/paper.pdf), [Project Page](https://research.nvidia.com/labs/toronto-ai/vipe), [Dataset](https://huggingface.co/) (Coming Soon)**
+**[Technical Whitepaper](https://research.nvidia.com/labs/toronto-ai/vipe/assets/paper.pdf), [Project Page](https://research.nvidia.com/labs/toronto-ai/vipe), [Dataset](#downloading-the-dataset)**
 
 ## Installation
 
@@ -178,8 +179,6 @@ Alternatively for a more lightweight and 3D consistent point cloud, you can add 
 
 ## Downloading the Dataset
 
-**This section is still under construction pending the final legal approval. We will make the HF link available as soon as possible.**
-
 ![dataset](assets/dataset.gif)
 
 Together with ViPE we release a large-scale dataset containing ~1M high-quality videos with accurate camera poses and dense depth maps. Specifications of the datasets are listed below:
@@ -224,7 +223,7 @@ We thank useful discussions from Aigul Dzhumamuratova, Viktor Kuznetsov, Soha Po
 ## TODO
 
 - [x] Initial code released under Apache 2.0 license.
-- [ ] Full dataset uploaded to Hugging Face for download.
+- [x] Full dataset uploaded to Hugging Face for download.
 - [ ] Add instructions to run inference on wide-angle and 360° videos.
 - [ ] Add instructions for benchmarking.
 
@@ -236,7 +235,7 @@ If you find ViPE useful in your research or application, please consider citing 
 @inproceedings{huang2025vipe,
     title={ViPE: Video Pose Engine for 3D Geometric Perception},
     author={Huang, Jiahui and Zhou, Qunjie and Rabeti, Hesam and Korovko, Aleksandr and Ling, Huan and Ren, Xuanchi and Shen, Tianchang and Gao, Jun and Slepichev, Dmitry and Lin, Chen-Hsuan and Ren, Jiawei and Xie, Kevin and Biswas, Joydeep and Leal-Taixe, Laura and Fidler, Sanja},
-    booktitle={NVIDIA Research Whitepapers},
+    booktitle={NVIDIA Research Whitepapers arXiv:2508.10934},
     year={2025}
 }
 ```

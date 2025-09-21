@@ -10,24 +10,24 @@ echo "Using ${NUM_GPUS} GPUs: ${AVAILABLE_GPUS}"
 
 # 실험 설정을 위한 associative array들
 declare -A experiments=(
-    #["cmu_bike01_2"]="cam02_static_vda_fixedcam_slammap ed3ec638-8363-4e1d-9851-c7936cbfad8c"
+    ["cmu_bike01_2"]="cam02_static_vda_fixedcam_slammap ed3ec638-8363-4e1d-9851-c7936cbfad8c"
     
     # Cooking datasets
-    ["fair_cooking_05_2"]="cam04_static_vda_fixedcam_slammap 3cbd7070-7c55-4b15-ac31-100ab8c7298a"
-    ["georgiatech_cooking_01_01_2"]="cam03_static_vda_fixedcam_slammap 51fc36b3-e769-4617-b087-3826b280cad3"
-    #["iiith_cooking_01_1"]="cam01_static_vda_fixedcam_slammap 98f58f0f-53d6-4e41-bf41-d8d74ccbc37c" # 처음부터 사람 등장 X
-    ["indiana_cooking_01_2"]="cam03_static_vda_fixedcam_slammap 644022d7-8e50-4bb2-bab8-f7ffbfdc7d17"
-    #["minnesota_cooking_010_2"]="cam01_static_vda_fixedcam_slammap d77bb04d-c881-48be-9cc2-d781c69207cd"  # annotations 없음
-    #["nus_cooking_06_2"]="cam02_static_vda_fixedcam_slammap f7b3e85b-7681-48b3-97cb-6b0a5705022e"  # annotations 없음
-    ["sfu_cooking015_2"]="cam04_static_vda_fixedcam_slammap 9bc33576-bcb6-42a5-b040-3220456f268f"
-    ["uniandes_cooking_001_10"]="cam02_static_vda_fixedcam_slammap a46d15b2-5c90-4938-bdca-40b87f51bec1"
+    # ["fair_cooking_05_2"]="cam04_static_vda_fixedcam_slammap 3cbd7070-7c55-4b15-ac31-100ab8c7298a"
+    # ["georgiatech_cooking_01_01_2"]="cam03_static_vda_fixedcam_slammap 51fc36b3-e769-4617-b087-3826b280cad3"
+    # #["iiith_cooking_01_1"]="cam01_static_vda_fixedcam_slammap 98f58f0f-53d6-4e41-bf41-d8d74ccbc37c" # 처음부터 사람 등장 X
+    # ["indiana_cooking_01_2"]="cam03_static_vda_fixedcam_slammap 644022d7-8e50-4bb2-bab8-f7ffbfdc7d17"
+    # #["minnesota_cooking_010_2"]="cam01_static_vda_fixedcam_slammap d77bb04d-c881-48be-9cc2-d781c69207cd"  # annotations 없음
+    # #["nus_cooking_06_2"]="cam02_static_vda_fixedcam_slammap f7b3e85b-7681-48b3-97cb-6b0a5705022e"  # annotations 없음
+    # ["sfu_cooking015_2"]="cam04_static_vda_fixedcam_slammap 9bc33576-bcb6-42a5-b040-3220456f268f"
+    # ["uniandes_cooking_001_10"]="cam02_static_vda_fixedcam_slammap a46d15b2-5c90-4938-bdca-40b87f51bec1"
 )
 
 # 공통 설정
 OUTPUT_DIR="ego_view_rendering"
 POINT_SIZE="1.5"
 START_FRAME="0"
-END_FRAME="600"
+END_FRAME="299"
 
 # 실험 실행 함수 (특정 GPU에서 실행)
 run_experiment() {
@@ -47,7 +47,7 @@ run_experiment() {
     echo "[GPU $gpu_id] =========================================="
     
     # 특정 GPU에서만 실행되도록 CUDA_VISIBLE_DEVICES 설정
-    CUDA_VISIBLE_DEVICES=$gpu_id python ego_view_rendering/render_vipe_pointcloud.py \
+    CUDA_VISIBLE_DEVICES=$gpu_id python scripts/render_vipe_pointcloud.py \
         --input_dir $INPUT_DIR \
         --out_dir $OUTPUT_DIR \
         --ego_camera_pose_path $EGO_CAMERA_POSE_PATH \

@@ -21,12 +21,18 @@ import hydra
 from vipe import get_config_path, make_pipeline
 from vipe.streams.base import ProcessedVideoStream
 from vipe.streams.raw_mp4_stream import RawMp4Stream
+from vipe.streams.frame_dir_stream import FrameDirStream
 from vipe.utils.logging import configure_logging
 from vipe.utils.viser import run_viser
 
 
 @click.command()
-@click.argument("video", type=click.Path(exists=True, path_type=Path))
+@click.argument("video", type=click.Path(exists=True, path_type=Path), required=False)
+@click.option(
+    "--image-dir",
+    type=click.Path(exists=True, path_type=Path),
+    help="Directory containing image frames",
+)
 @click.option(
     "--output",
     "-o",
@@ -39,10 +45,19 @@ from vipe.utils.viser import run_viser
 @click.option("--start_frame", type=int, default=0, help="Starting frame number (default: 0)")
 @click.option("--end_frame", type=int, default=None, help="Ending frame number (inclusive, default: process all frames)")
 @click.option("--assume_fixed_camera_pose", is_flag=True, help="Assume camera pose is fixed throughout the video (skips SLAM pose estimation)")
-def infer(video: Path, output: Path, pipeline: str, visualize: bool, start_frame: int, end_frame: int, assume_fixed_camera_pose: bool):
-    """Run inference on a video file."""
+def infer(video: Path, image_dir: Path, output: Path, pipeline: str, visualize: bool, start_frame: int, end_frame: int, assume_fixed_camera_pose: bool):
+    """Run inference on a video file or directory of images."""
 
     logger = configure_logging()
+
+    # Validate that exactly one input source is provided
+    if not video and not image_dir:
+        click.echo("Error: Must provide either a video file or --image-dir", err=True)
+        raise click.Abort()
+    
+    if video and image_dir:
+        click.echo("Error: Cannot provide both video file and --image-dir", err=True)
+        raise click.Abort()
 
     # Create output directory based on video name
     video_name = video.stem  # Get filename without extension
@@ -76,29 +91,45 @@ def infer(video: Path, output: Path, pipeline: str, visualize: bool, start_frame
         overrides.append("pipeline.assume_fixed_camera_pose=true")
         logger.info("Fixed camera pose mode enabled - SLAM pose estimation will be skipped")
 
+    # Set up stream configuration based on input type
+    if image_dir:
+        overrides.extend([
+            "streams=frame_dir_stream",
+            f"streams.base_path={image_dir}"
+        ])
+        input_path = image_dir
+        input_desc = f"image directory {image_dir}"
+    else:
+        input_path = video
+        input_desc = f"video {video}"
+
     with hydra.initialize_config_dir(config_dir=str(get_config_path()), version_base=None):
         args = hydra.compose("default", overrides=overrides)
 
-    logger.info(f"Processing {video}...")
+    logger.info(f"Processing {input_desc}...")
     logger.info(f"Output will be saved to: {video_output_path}")
     vipe_pipeline = make_pipeline(args.pipeline)
 
-    # Some input videos can be malformed, so we need to cache the videos to obtain correct number of frames.
-    # Apply frame range if specified
-    if end_frame is not None:
-        seek_range = range(start_frame, end_frame + 1)  # +1 to make end_frame inclusive
-        video_stream = ProcessedVideoStream(RawMp4Stream(video, seek_range=seek_range), []).cache(desc="Reading video stream")
-        logger.info(f"Processing frames {start_frame} to {end_frame} ({end_frame - start_frame + 1} frames)")
-    elif start_frame > 0:
-        # If only start_frame is specified, process from start_frame to end
-        video_stream = ProcessedVideoStream(RawMp4Stream(video), []).cache(desc="Reading video stream")
-        total_frames = len(video_stream)
-        seek_range = range(start_frame, total_frames)
-        video_stream = ProcessedVideoStream(RawMp4Stream(video, seek_range=seek_range), []).cache(desc="Reading video stream")
-        logger.info(f"Processing frames {start_frame} to {total_frames-1} ({total_frames - start_frame} frames)")
+    if image_dir:
+        # Use frame directory stream
+        video_stream = ProcessedVideoStream(FrameDirStream(image_dir), []).cache(desc="Reading image frames")
     else:
-        video_stream = ProcessedVideoStream(RawMp4Stream(video), []).cache(desc="Reading video stream")
-        logger.info(f"Processing all {len(video_stream)} frames (0 to {len(video_stream)-1})")
+        # Some input videos can be malformed, so we need to cache the videos to obtain correct number of frames.
+        # Apply frame range if specified
+        if end_frame is not None:
+            seek_range = range(start_frame, end_frame + 1)  # +1 to make end_frame inclusive
+            video_stream = ProcessedVideoStream(RawMp4Stream(video, seek_range=seek_range), []).cache(desc="Reading video stream")
+            logger.info(f"Processing frames {start_frame} to {end_frame} ({end_frame - start_frame + 1} frames)")
+        elif start_frame > 0:
+            # If only start_frame is specified, process from start_frame to end
+            video_stream = ProcessedVideoStream(RawMp4Stream(video), []).cache(desc="Reading video stream")
+            total_frames = len(video_stream)
+            seek_range = range(start_frame, total_frames)
+            video_stream = ProcessedVideoStream(RawMp4Stream(video, seek_range=seek_range), []).cache(desc="Reading video stream")
+            logger.info(f"Processing frames {start_frame} to {total_frames-1} ({total_frames - start_frame} frames)")
+        else:
+            video_stream = ProcessedVideoStream(RawMp4Stream(video), []).cache(desc="Reading video stream")
+            logger.info(f"Processing all {len(video_stream)} frames (0 to {len(video_stream)-1})")
 
     vipe_pipeline.run(video_stream)
     logger.info("Finished")
