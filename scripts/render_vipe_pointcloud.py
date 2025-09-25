@@ -1540,8 +1540,10 @@ def get_parser():
     parser.add_argument("--ego_camera_pose_path", required=True, help="Path to ego camera pose JSON file for rendering")
     parser.add_argument("--exo_camera_pose_path", required=True, help="Path to exo camera pose CSV file for coordinate transformation")
     parser.add_argument("--point_size", type=float, default=1.0, help="Size of rendered points")
-    parser.add_argument("--start_frame", type=int, default=0, help="Starting frame number (default: 0)")
-    parser.add_argument("--end_frame", type=int, required=True, help="Ending frame number (inclusive)")
+    parser.add_argument("--start_frame", type=int, default=0, help="Starting frame number for rendering (default: 0)")
+    parser.add_argument("--end_frame", type=int, required=True, help="Ending frame number for rendering (inclusive)")
+    parser.add_argument("--source_start_frame", type=int, help="Source start frame for extrinsics slicing")
+    parser.add_argument("--source_end_frame", type=int, help="Source end frame for extrinsics slicing")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for rendering (default: 8)")
     parser.add_argument("--only_bg", action="store_true", help="Only render background points")
     parser.add_argument("--use_mean_bg", action="store_true", help="Use nanmean background instead of standard background")
@@ -1776,8 +1778,16 @@ def main():
     elif fish_eye_enabled:
         logger.info("Using default fish-eye distortion coefficients")
     
-    # Select extrinsics for the frames to render (slice by start_frame and end_frame inclusive)
-    ego_extrinsics_to_render = ego_extrinsics_list[args.start_frame:effective_end_frame + 1]  # +1 for inclusive end
+    # Select extrinsics for the frames to render
+    # Use source frame parameters if provided, otherwise fall back to render frame parameters
+    if hasattr(args, 'source_start_frame') and args.source_start_frame is not None:
+        extrinsics_start = args.source_start_frame
+        extrinsics_end = args.source_end_frame if hasattr(args, 'source_end_frame') and args.source_end_frame is not None else effective_end_frame
+        logger.info(f"Using source frame range for extrinsics: {extrinsics_start} to {extrinsics_end}")
+    else:
+        raise ValueError("source_start_frame and source_end_frame must be provided")
+    
+    ego_extrinsics_to_render = ego_extrinsics_list[extrinsics_start:extrinsics_end + 1]  # +1 for inclusive end
 
     # Find artifact path for dynamic per-frame construction
     artifact_paths = list(ArtifactPath.glob_artifacts(Path(args.input_dir), use_video=True))
