@@ -9,9 +9,30 @@ Before running the rendering commands, ensure you have completed the ViPE infere
 ```bash
 # First, run ViPE inference using the batch script
 ./scripts/infer_vipe.sh
+# Or use the script with GT intrinsics support(example):
+./scripts/infer_all_cooking_with_exo_intr_gt_svda.sh
 ```
 
-This script will run ViPE inference with the following parameters: `--start_frame`, `--end_frame`, `--assume_fixed_camera_pose`, and `--pipeline` settings. The script generates the necessary pose and depth information in the output directory.
+The scripts run ViPE inference with various parameters. Below are the key CLI arguments used:
+
+#### Core Arguments
+
+- `--start_frame <int>`: Starting frame number (default: 0)
+- `--end_frame <int>`: Ending frame number (inclusive, default: process all frames)
+- `--assume_fixed_camera_pose`: Flag to assume camera pose is fixed throughout the video
+- `--pipeline <str>`: Pipeline configuration to use (default: "default")
+  - Available pipelines: `default`, `lyra`, `lyra_no_vda`, `no_vda`, etc.
+  - `default`: Uses UniDepthV2 for depth estimation
+  - `lyra`: Uses MoGE2 for depth estimation with VDA enabled for better temporal depth consistency
+  - `lyra_no_vda` / `no_vda`: Disables Video Depth Anything (VDA) for reduced GPU memory usage
+
+- `--use_exo_intrinsic_gt <take_uuid>`: Use ground truth exocentric camera intrinsics instead of ViPE-estimated intrinsics
+  - Takes a `take_uuid` (string) as argument
+  - Automatically sets `optimize_intrinsics=False` when provided
+  - **⚠️ IMPORTANT**: Loads intrinsics from Ego4D camera pose JSON. The path is currently hardcoded in `GTIntrinsicsProcessor`. **You must modify the path in `vipe/pipeline/processors.py` to match your environment before using this option.**
+  - The GT intrinsics are scaled based on current frame resolution (using cy ratio)
+  - Example: `--use_exo_intrinsic_gt "18e2cf60-65f4-4715-91e0-3917deb5daa8"`
+  - When used, the output directory name will have `_exo_intr_gt` suffix appended
 
 ### Rendering with Scripts
 

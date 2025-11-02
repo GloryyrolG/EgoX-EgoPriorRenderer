@@ -37,20 +37,21 @@ from vipe.utils.cameras import CameraType
 from vipe.utils.visualization import save_projection_video
 
 from . import AnnotationPipelineOutput, Pipeline
-from .processors import AdaptiveDepthProcessor, GeoCalibIntrinsicsProcessor, TrackAnythingProcessor
+from .processors import AdaptiveDepthProcessor, GeoCalibIntrinsicsProcessor, GTIntrinsicsProcessor, TrackAnythingProcessor
 
 
 logger = logging.getLogger(__name__)
 
 
 class DefaultAnnotationPipeline(Pipeline):
-    def __init__(self, init: DictConfig, slam: DictConfig, post: DictConfig, output: DictConfig, assume_fixed_camera_pose: bool = False) -> None:
+    def __init__(self, init: DictConfig, slam: DictConfig, post: DictConfig, output: DictConfig, assume_fixed_camera_pose: bool = False, use_exo_intrinsic_gt: str = None) -> None:
         super().__init__()
         self.init_cfg = init
         self.slam_cfg = slam
         self.post_cfg = post
         self.out_cfg = output
         self.assume_fixed_camera_pose = assume_fixed_camera_pose
+        self.use_exo_intrinsic_gt = use_exo_intrinsic_gt
         
         # Modify output path based on depth_align_model
         output_path = Path(self.out_cfg.path)
@@ -62,6 +63,10 @@ class DefaultAnnotationPipeline(Pipeline):
             output_path = output_path.parent / f"{output_path.name}_no_vda"
         elif depth_align_model == "adaptive_unidepth-l_metric-vda":
             output_path = output_path.parent / f"{output_path.name}_metric_vda"
+        elif depth_align_model == "adaptive_moge_vda":
+            output_path = output_path.parent / f"{output_path.name}_moge_static_vda"
+        elif depth_align_model == "adaptive_moge":
+            output_path = output_path.parent / f"{output_path.name}_moge_no_vda"
 
         # Add _fixedcam suffix to the output directory name
         if self.assume_fixed_camera_pose:
@@ -69,6 +74,9 @@ class DefaultAnnotationPipeline(Pipeline):
         # Add _slammap suffix when save_slam_map is enabled in output config
         if getattr(self.out_cfg, "save_slam_map", False):
             output_path = output_path.parent / (output_path.name + "_slammap")
+        # Add _use_gt_intrinsic suffix when GT intrinsics are used
+        if self.use_exo_intrinsic_gt is not None:
+            output_path = output_path.parent / (output_path.name + "_exo_intr_gt")
         
         self.out_path = output_path
         self.out_path.mkdir(exist_ok=True, parents=True)
@@ -79,12 +87,18 @@ class DefaultAnnotationPipeline(Pipeline):
 
         # The assertions make sure that the attributes are not estimated previously.
         # Otherwise it will be overwritten by the processors.
-        assert FrameAttribute.INTRINSICS not in video_stream.attributes()
+        # Skip intrinsics assertion if using GT intrinsics (optimize_intrinsics=False)
+        if self.slam_cfg.optimize_intrinsics:
+            assert FrameAttribute.INTRINSICS not in video_stream.attributes()
         assert FrameAttribute.CAMERA_TYPE not in video_stream.attributes()
         assert FrameAttribute.METRIC_DEPTH not in video_stream.attributes()
         assert FrameAttribute.INSTANCE not in video_stream.attributes()
 
-        init_processors.append(GeoCalibIntrinsicsProcessor(video_stream, camera_type=self.camera_type))
+        # Use GT intrinsics processor if take_uuid is provided, otherwise use GeoCalib
+        if self.use_exo_intrinsic_gt is not None:
+            init_processors.append(GTIntrinsicsProcessor(video_stream, take_uuid=self.use_exo_intrinsic_gt, camera_type=self.camera_type))
+        else:
+            init_processors.append(GeoCalibIntrinsicsProcessor(video_stream, camera_type=self.camera_type))
         if self.init_cfg.instance is not None:
             init_processors.append(
                 TrackAnythingProcessor(

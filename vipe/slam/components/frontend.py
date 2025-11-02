@@ -87,6 +87,7 @@ class SLAMFrontend:
         if self.graph.corr is not None:
             self.graph.rm_factors(self.graph.age > self.max_age, store=True)
 
+        # Always add factors for depth optimization, even when poses are fixed
         self.graph.add_proximity_factors(
             self.t1 - 5,
             max(self.t1 - self.frontend_window, 0),
@@ -97,9 +98,9 @@ class SLAMFrontend:
             remove=True,
         )
 
-        if optimize_poses:
-            for _ in range(self.iters1):
-                self.graph.update(use_inactive=True, fixed_motion=self.has_init_pose)
+        # Perform BA for depth optimization (pose will be fixed if optimize_poses=False)
+        for _ in range(self.iters1):
+            self.graph.update(use_inactive=True, fixed_motion=self.has_init_pose, optimize_poses=optimize_poses)
 
         # remove frame t1-2 if it is too close to t1-3, so the new keyframes will be [t1-3, t1-1]
         d = self.video.frame_distance_dense_disp(
@@ -112,9 +113,9 @@ class SLAMFrontend:
             self.graph.rm_second_newest_keyframe(self.t1 - 2)
             self.t1 -= 1
         else:
-            if optimize_poses:
-                for _ in range(self.iters2):
-                    self.graph.update(use_inactive=True, fixed_motion=self.has_init_pose)
+            # Perform additional BA iterations for depth optimization
+            for _ in range(self.iters2):
+                self.graph.update(use_inactive=True, fixed_motion=self.has_init_pose, optimize_poses=optimize_poses)
 
         # set pose for next iteration
         if optimize_poses and not self.has_init_pose:
@@ -137,15 +138,15 @@ class SLAMFrontend:
 
         self.t1 = self.video.n_frames
 
-        if optimize_poses:
-            self.graph.add_neighborhood_factors(0, self.t1, r=1 if self.args.seq_init else 3)
+        # Always add factors for depth optimization, even when poses are fixed
+        self.graph.add_neighborhood_factors(0, self.t1, r=1 if self.args.seq_init else 3)
 
-        if not self.args.seq_init and optimize_poses:
+        if not self.args.seq_init:
             self.graph.add_proximity_factors(0, 0, rad=2, nms=2, thresh=self.frontend_thresh, remove=False)
         
-        if optimize_poses:
-            for _ in range(8):
-                self.graph.update(t0=1, use_inactive=True, fixed_motion=self.has_init_pose)
+        # Perform BA for depth optimization (pose will be fixed if optimize_poses=False)
+        for _ in range(8):
+            self.graph.update(t0=1, use_inactive=True, fixed_motion=self.has_init_pose, optimize_poses=optimize_poses)
 
         if optimize_poses and not self.has_init_pose:
             self.__init_pose()

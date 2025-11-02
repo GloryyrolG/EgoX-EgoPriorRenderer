@@ -171,3 +171,7 @@ JIAHUI.md
 
 # ego view render results
 ego_view_rendering/
+ego_view_rendering_debug/
+render_logs/
+
+scripts_dummy/

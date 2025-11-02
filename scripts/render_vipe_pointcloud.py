@@ -142,7 +142,7 @@ def check_coordinate_system_consistency(T_cam_to_world, ego_intrinsics, ego_extr
         is_fisheye: Whether to use fish-eye rendering
         online_calibration_path: Path to online calibration file
         original_image_size: Original image size for consistency check
-        cam_id: Camera ID for logging (e.g., 'cam01', 'cam02', etc.)
+        cam_id: Camera ID for logging (e.g., 'cam01', 'cam02', 'gp01', 'gp02', etc.)
         is_fisheye: Flag to indicate if fish-eye checks should be used
         online_calibration_path: Path to calibration file for fish-eye intrinsics
         original_image_size: (H, W) of the original camera sensor, for scaling intrinsics
@@ -442,15 +442,15 @@ def parse_camera_id_from_input_dir(input_dir: str) -> str:
     Parse camera ID from input directory path.
     
     Args:
-        input_dir: Input directory path like 'vipe_results/take_name/cam04_static_vda_fixedcam_slammap'
+        input_dir: Input directory path like 'vipe_results/take_name/cam04_static_vda_fixedcam_slammap' or 'vipe_results/take_name/gp02_static_vda_fixedcam_slammap'
     
     Returns:
-        Camera ID string like 'cam04'
+        Camera ID string like 'cam04' or 'gp02'
     """
     import re
     
-    # Extract camera ID pattern (cam + 2 digits)
-    pattern = r'cam\d{2}'
+    # Extract camera ID pattern (cam + 2 digits or gp + 2 digits)
+    pattern = r'(cam\d{2}|gp\d{2})'
     match = re.search(pattern, input_dir)
     
     if match:
@@ -459,7 +459,7 @@ def parse_camera_id_from_input_dir(input_dir: str) -> str:
         return cam_id
     else:
         # No fallback - raise error if camera ID cannot be parsed
-        raise ValueError(f"Could not parse camera ID from input_dir: {input_dir}. Expected format with 'camXX' pattern (e.g., cam01, cam02, cam03, etc.)")
+        raise ValueError(f"Could not parse camera ID from input_dir: {input_dir}. Expected format with 'camXX' or 'gpXX' pattern (e.g., cam01, cam02, gp01, gp02, etc.)")
 
 def load_exo_camera_pose(exo_camera_pose_path: str, cam_id: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -467,7 +467,7 @@ def load_exo_camera_pose(exo_camera_pose_path: str, cam_id: str) -> Tuple[np.nda
     
     Args:
         exo_camera_pose_path: Path to gopro_calibs.csv file
-        cam_id: Camera ID to extract (required, e.g., 'cam01', 'cam02', 'cam03', etc.)
+        cam_id: Camera ID to extract (required, e.g., 'cam01', 'cam02', 'gp01', 'gp02', etc.)
     
     Returns:
         T_world_to_cam: 4x4 transformation matrix from world to camera coordinates
@@ -1289,15 +1289,21 @@ def render_points_fisheye(points_world, colors_world, T_w2c, ego_intrinsics, W=6
     
     # Flip Y and Z axes to convert from OpenCV to PyTorch3D
     # This is the same transformation that cameras_from_opencv_projection does internally
-    coord_transform = np.array([
+    coord_transform_between_opencv_and_pytorch = np.array([
         [-1,  0,  0],
         [ 0, -1,  0], 
         [ 0,  0,  1]
     ], dtype=np.float32)
-    
+    coord_transform_for_aria_cam = np.array([
+        [ 0,  1,  0],
+        [-1,  0,  0], 
+        [ 0,  0,  1]
+    ], dtype=np.float32) # coord ccw 90 rotate
+
     # Apply coordinate transformation to rotation and translation
-    R_pt3d = R_cv.T @ coord_transform
-    t_pt3d = coord_transform @ t_cv
+    coord_transform_total = coord_transform_between_opencv_and_pytorch @ coord_transform_for_aria_cam
+    R_pt3d = R_cv.T @ coord_transform_total
+    t_pt3d = coord_transform_total.T @ t_cv
 
     R_t = torch.from_numpy(R_pt3d).to(device=device, dtype=torch.float32).unsqueeze(0)  # (1,3,3)
     T_t = torch.from_numpy(t_pt3d).to(device=device, dtype=torch.float32).unsqueeze(0)  # (1,3)
@@ -1402,9 +1408,9 @@ def render_points_fisheye(points_world, colors_world, T_w2c, ego_intrinsics, W=6
     final_img_uint8 = (np.clip(final_img, 0.0, 1.0) * 255).astype(np.uint8)
     
     # Apply simple 90-degree rotation to fix image orientation
-    final_img_rotated = cv2.rotate(final_img_uint8, cv2.ROTATE_90_CLOCKWISE)
+    # final_img_rotated = cv2.rotate(final_img_uint8, cv2.ROTATE_90_CLOCKWISE)
 
-    return final_img_rotated
+    return final_img_uint8 #final_img_rotated
 
 def project_points_to_image_sequential(bg_points_3d: np.ndarray, bg_colors: np.ndarray,
                                       ego_extrinsics_list: List[np.ndarray], ego_intrinsics: np.ndarray,
@@ -1569,7 +1575,7 @@ def configure_output_directory(args) -> str:
         # Get parent directory name (e.g., 'cmu_bike01_2') and last segment
         if len(input_path_parts) >= 2:
             parent_dir = input_path_parts[-2]  # e.g., 'cmu_bike01_2'
-            input_last = input_path_parts[-1]  # e.g., 'cam01_static_vda_fixedcam'
+            input_last = input_path_parts[-1]  # e.g., 'cam01_static_vda_fixedcam' or 'gp02_static_vda_fixedcam'
         else:
             parent_dir = "unknown"
             input_last = input_path_parts[-1] if input_path_parts else "unknown"

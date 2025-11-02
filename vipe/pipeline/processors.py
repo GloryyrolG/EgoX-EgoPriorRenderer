@@ -104,6 +104,81 @@ class GeoCalibIntrinsicsProcessor(IntrinsicEstimationProcessor):
             self.distortion = [res["camera"].dist[0, 0].item()]
 
 
+class GTIntrinsicsProcessor(StreamProcessor):
+    """Load ground truth intrinsics from camera_pose JSON files."""
+    
+    def __init__(
+        self,
+        video_stream: VideoStream,
+        take_uuid: str,
+        camera_type: CameraType = CameraType.PINHOLE,
+    ) -> None:
+        super().__init__()
+        self.camera_type = camera_type
+        self.take_uuid = take_uuid
+        self.camera_name = video_stream.name()  # e.g., "cam01"
+        
+        # Load GT intrinsics from JSON
+        from pathlib import Path
+        json_path = Path(f"/home/nas_main/kinamkim/DATA/Ego4D/dataset_train/annotations/ego_pose/train/camera_pose/{take_uuid}.json")
+        
+        if not json_path.exists():
+            raise FileNotFoundError(f"GT intrinsics file not found: {json_path}")
+            
+        import json
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+            
+        if self.camera_name not in data:
+            raise KeyError(f"Camera '{self.camera_name}' not found in GT data. Available cameras: {list(data.keys())}")
+            
+        camera_data = data[self.camera_name]
+        
+        # Extract intrinsics matrix [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
+        K_matrix = np.array(camera_data["camera_intrinsics"])
+        self.gt_fx = K_matrix[0, 0]
+        self.gt_fy = K_matrix[1, 1]
+        self.gt_cy = K_matrix[1, 2]
+        
+        # Extract distortion coefficients (GeoCalibProcessor와 동일하게 처리)
+        # PINHOLE이면 distortion 사용 안 함, 아니면 사용
+        is_pinhole = camera_type == CameraType.PINHOLE
+        if not is_pinhole:
+            distortion_coeffs = camera_data.get("distortion_coeffs", [])
+            # GeoCalibProcessor는 단일 distortion 값만 사용하므로 첫 번째 값만 사용
+            if distortion_coeffs:
+                self.distortion = [distortion_coeffs[0]]
+            else:
+                self.distortion = []
+        else:
+            self.distortion = []
+        
+        logging.info(f"Loaded GT intrinsics for {self.camera_name}: gt_fx={self.gt_fx:.2f}, gt_fy={self.gt_fy:.2f}, gt_cy={self.gt_cy:.2f}, camera_type={self.camera_type}, distortion={'present' if self.distortion else 'none'}")
+
+    def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
+        return previous_attributes | {FrameAttribute.INTRINSICS}
+
+    def __call__(self, frame_idx: int, frame: VideoFrame) -> VideoFrame:
+        """Apply GT intrinsics to frame, scaling to current frame size."""
+        frame_height, frame_width = frame.size()
+        
+        # cx, cy는 현재 프레임의 실제 해상도 기준으로 사용
+        cx = frame_width / 2.0
+        cy = frame_height / 2.0
+        
+        # fx, fy는 GT의 cy와 현재 프레임의 cy를 비교해서 height 기준으로 스케일링
+        scale = cy / self.gt_cy
+        fx_scaled = self.gt_fx * scale
+        fy_scaled = self.gt_fy * scale
+        
+        # GeoCalibProcessor와 동일하게 처리: [fx, fy, cx, cy] + distortion
+        frame.intrinsics = torch.as_tensor(
+            [fx_scaled, fy_scaled, cx, cy] + self.distortion,
+        ).float()
+        frame.camera_type = self.camera_type
+        return frame
+
+
 class TrackAnythingProcessor(StreamProcessor):
     """
     A processor that tracks a mask caption in the video.

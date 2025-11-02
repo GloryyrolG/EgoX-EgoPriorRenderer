@@ -45,7 +45,8 @@ from vipe.utils.viser import run_viser
 @click.option("--start_frame", type=int, default=0, help="Starting frame number (default: 0)")
 @click.option("--end_frame", type=int, default=None, help="Ending frame number (inclusive, default: process all frames)")
 @click.option("--assume_fixed_camera_pose", is_flag=True, help="Assume camera pose is fixed throughout the video (skips SLAM pose estimation)")
-def infer(video: Path, image_dir: Path, output: Path, pipeline: str, visualize: bool, start_frame: int, end_frame: int, assume_fixed_camera_pose: bool):
+@click.option("--use_exo_intrinsic_gt", type=str, default=None, help="Take UUID for using exo GT intrinsics instead of ViPE intrinsics (sets optimize_intrinsics=False)")
+def infer(video: Path, image_dir: Path, output: Path, pipeline: str, visualize: bool, start_frame: int, end_frame: int, assume_fixed_camera_pose: bool, use_exo_intrinsic_gt: str):
     """Run inference on a video file or directory of images."""
 
     logger = configure_logging()
@@ -90,6 +91,11 @@ def infer(video: Path, image_dir: Path, output: Path, pipeline: str, visualize: 
     if assume_fixed_camera_pose:
         overrides.append("pipeline.assume_fixed_camera_pose=true")
         logger.info("Fixed camera pose mode enabled - SLAM pose estimation will be skipped")
+    
+    if use_exo_intrinsic_gt is not None:
+        overrides.append("pipeline.slam.optimize_intrinsics=false")
+        overrides.append(f"pipeline.use_exo_intrinsic_gt={use_exo_intrinsic_gt}")
+        logger.info(f"Exo GT intrinsics mode enabled (take_uuid: {use_exo_intrinsic_gt}) - intrinsics optimization will be disabled")
 
     # Set up stream configuration based on input type
     if image_dir:
@@ -139,8 +145,15 @@ def infer(video: Path, image_dir: Path, output: Path, pipeline: str, visualize: 
 @click.argument("data_path", type=click.Path(exists=True, path_type=Path), default=Path.cwd() / "vipe_results")
 @click.option("--port", "-p", default=20540, type=int, help="Port for the visualization server (default: 20540)")
 @click.option("--use_mean_bg", is_flag=True, help="Use robust statistical mean background instead of standard background")
-def visualize(data_path: Path, port: int, use_mean_bg: bool):
-    run_viser(data_path, port, use_mean_bg)
+@click.option("--take_uuid", type=str, help="Take UUID for ego camera pose visualization (optional)")
+@click.option("--start_frame", type=int, help="Start frame for ego camera pose visualization (required if --take_uuid is provided)")
+@click.option("--use_exo_intrinsic_gt", is_flag=True, help="Use exo GT intrinsics from online_calibration.jsonl instead of ViPE intrinsics")
+def visualize(data_path: Path, port: int, use_mean_bg: bool, take_uuid: str, start_frame: int, use_exo_intrinsic_gt: bool):
+    # Validate that start_frame is provided if take_uuid is provided
+    if take_uuid is not None and start_frame is None:
+        raise click.ClickException("--start_frame is required when --take_uuid is provided")
+    
+    run_viser(data_path, port, use_mean_bg, take_uuid, start_frame, use_exo_intrinsic_gt)
 
 
 @click.group()
