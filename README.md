@@ -191,5 +191,5 @@ This script will:
 
 ## 🙏 Acknowledgements
 
-This `EgoX`'s ego prior rendering project is built upon the `ViPE`(Video Pose Engine) project. We gratefully acknowledge their excellent work in video pose estimation and depth map generation. For more details, please visit the [ViPE](https://github.com/nv-tlabs/vipe) GitHub repository.
+This `EgoX`'s ego prior rendering codebase is built upon the `ViPE`(Video Pose Engine) project. We gratefully acknowledge their excellent work in video pose estimation and depth map generation. For more details, please visit the [ViPE](https://github.com/nv-tlabs/vipe) GitHub repository.
 
