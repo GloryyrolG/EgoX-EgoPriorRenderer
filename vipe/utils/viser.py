@@ -36,14 +36,6 @@ from rich.logging import RichHandler
 import pandas as pd
 from scipy.spatial.transform import Rotation as R
 
-try:
-    import projectaria_tools.core.mps as mps
-    from projectaria_tools.core.mps.utils import filter_points_from_confidence
-    PROJECTARIA_AVAILABLE = True
-except ImportError:
-    PROJECTARIA_AVAILABLE = False
-    print("Warning: projectaria-tools not available. Semi-dense point cloud visualization will be disabled.")
-
 from vipe.utils.cameras import CameraType
 from vipe.utils.depth import reliable_depth_mask_range
 from vipe.utils.io import (
@@ -86,16 +78,8 @@ def compute_robust_mean_tensors(stacked_depth: torch.Tensor, stacked_rgb: torch.
 class GlobalContext:
     artifacts: list[ArtifactPath]
     use_mean_bg: bool = False
-    use_exo_intrinsic_gt: bool = False
     mean_depth: torch.Tensor = None
     mean_rgb: torch.Tensor = None
-    take_uuid: str = None
-    start_frame: int = None
-    ego_extrinsics_list: List[np.ndarray] = None
-    exo_cam_to_world: np.ndarray = None
-    semidense_points: np.ndarray = None  # Ego4D semi-dense point cloud
-    gt_exo_intrinsics_K: np.ndarray | None = None  # 3x3
-    gt_exo_image_size: Tuple[int, int] | None = None  # (width, height)
     ego_manual: bool = False  # Manual ego camera control mode
     
     def __post_init__(self):
@@ -503,14 +487,6 @@ class ClientClosures:
         with self.client.atomic():
             self._rebuild_scene()
             
-            # Add ego camera frustums and world axes if take_uuid is provided
-            take_uuid = self.global_context().take_uuid
-            if take_uuid is not None:
-                self._add_ego_camera_frustums()
-                self._add_ego_trajectory()  # Add trajectory visualization
-                self._add_ego4d_world_axes()
-                self._add_semidense_point_cloud()
-            
             # Add manual ego camera if enabled
             if self.global_context().ego_manual:
                 self._add_manual_ego_camera()
@@ -528,246 +504,6 @@ class ClientClosures:
                 rainbow_value = cm.jet(1.0 - frame_idx / denom)[:3]
                 rainbow_value = tuple((int(c * 255) for c in rainbow_value))
                 frame_node.frustum_handle.color = rainbow_value
-
-    def _add_ego_camera_frustums(self):
-        """Add ego camera frustums to the scene in exo camera coordinate system."""
-        logger.info("Adding ego camera frustums to scene...")
-        
-        ego_extrinsics_list = self.global_context().ego_extrinsics_list
-        exo_cam_to_world = self.global_context().exo_cam_to_world
-        
-        if ego_extrinsics_list is None or exo_cam_to_world is None:
-            logger.warning("Missing ego camera data, skipping ego frustum visualization")
-            return
-
-        # Compute transformation from Ego4D world to ViPE world using exo camera alignment
-        try:
-            current_artifact = self.global_context().artifacts[self.gui_id.value]
-            # Use first ViPE exo camera pose as world alignment reference
-            vipe_c2w_iter = read_pose_artifacts(current_artifact.pose_path)[1].matrix().numpy()
-            vipe_exo_c2w = next(iter(vipe_c2w_iter))
-            ego_exo_c2w = exo_cam_to_world
-            # T_egoWorld_to_vipeWorld maps Ego4D world coords -> ViPE world coords
-            T_egoW_to_vipeW = vipe_exo_c2w @ np.linalg.inv(ego_exo_c2w)
-            logger.info("Computed Ego4D->ViPE world alignment from exo camera poses")
-        except Exception as e:
-            logger.warning(f"Failed to compute Ego4D->ViPE alignment: {e}")
-            return
-
-        # Use default FOV for ego camera frustums (no intrinsics needed)
-        fov = np.radians(60.0)  # Default 60 degrees FOV
-        logger.info(f"Using default ego camera FOV: {np.degrees(fov):.1f}°")
-        
-        # Add ego camera frustums for each frame (placed in ViPE world coordinates)
-        self.ego_frustum_handles = []
-        for frame_idx, ego_w2c in enumerate(ego_extrinsics_list):
-            # Convert ego W2C (3x4) to 4x4 matrix
-            ego_w2c_4x4 = np.eye(4)
-            ego_w2c_4x4[:3, :] = ego_w2c
-            
-            # Convert to ego C2W in Ego4D world
-            ego_c2w_egoW = np.linalg.inv(ego_w2c_4x4)
-
-            # Convert ego camera pose into ViPE world coordinates
-            ego_c2w_vipeW = T_egoW_to_vipeW @ ego_c2w_egoW
-            
-            # Extract position and rotation
-            ego_position = ego_c2w_vipeW[:3, 3]
-            ego_rotation = ego_c2w_vipeW[:3, :3]
-            
-            # Convert rotation matrix to quaternion for viser
-            ego_quat = tf.SO3.from_matrix(ego_rotation).wxyz
-            
-            # Add ego camera frustum
-            ego_frustum_handle = self.client.scene.add_camera_frustum(
-                f"/ego_cameras/frame_{frame_idx}",
-                fov=fov,
-                aspect=1.0,  # Assume square aspect ratio
-                scale=self.gui_frustum_size.value * 0.8,  # Slightly smaller than exo frustums
-                wxyz=ego_quat,
-                position=ego_position,
-            )
-            
-            # Color ego frustums differently (green-ish)
-            ego_frustum_handle.color = (0, 255, 0)  # Green color for ego cameras
-            
-            # Initially hide all ego frustums (will be shown based on timeline)
-            ego_frustum_handle.visible = False
-            
-            self.ego_frustum_handles.append(ego_frustum_handle)
-            logger.info(f"Added ego camera frustum for frame {frame_idx} at position {ego_position}")
-        
-        logger.info(f"Successfully added {len(ego_extrinsics_list)} ego camera frustums")
-
-    def _add_ego_trajectory(self):
-        """Add trajectory line connecting ego camera positions."""
-        logger.info("Adding ego camera trajectory...")
-        
-        ego_extrinsics_list = self.global_context().ego_extrinsics_list
-        exo_cam_to_world = self.global_context().exo_cam_to_world
-        
-        if ego_extrinsics_list is None or exo_cam_to_world is None:
-            logger.warning("Missing ego camera data, skipping trajectory visualization")
-            return
-        
-        try:
-            current_artifact = self.global_context().artifacts[self.gui_id.value]
-            # Use first ViPE exo camera pose as world alignment reference
-            vipe_c2w_iter = read_pose_artifacts(current_artifact.pose_path)[1].matrix().numpy()
-            vipe_exo_c2w = next(iter(vipe_c2w_iter))
-            ego_exo_c2w = exo_cam_to_world
-            # T_egoWorld_to_vipeWorld maps Ego4D world coords -> ViPE world coords
-            T_egoW_to_vipeW = vipe_exo_c2w @ np.linalg.inv(ego_exo_c2w)
-        except Exception as e:
-            logger.warning(f"Failed to compute Ego4D->ViPE alignment for trajectory: {e}")
-            return
-        
-        # Extract ego camera positions in ViPE world coordinates
-        trajectory_points = []
-        for ego_w2c in ego_extrinsics_list:
-            # Convert ego W2C (3x4) to 4x4 matrix
-            ego_w2c_4x4 = np.eye(4)
-            ego_w2c_4x4[:3, :] = ego_w2c
-            
-            # Convert to ego C2W in Ego4D world
-            ego_c2w_egoW = np.linalg.inv(ego_w2c_4x4)
-            
-            # Convert ego camera pose into ViPE world coordinates
-            ego_c2w_vipeW = T_egoW_to_vipeW @ ego_c2w_egoW
-            
-            # Extract position
-            ego_position = ego_c2w_vipeW[:3, 3]
-            trajectory_points.append(ego_position)
-        
-        trajectory_points = np.array(trajectory_points)
-        
-        # Add trajectory as thick dashed line (점선 효과)
-        # 점선을 만들기 위해 일정 간격으로 선분을 건너뛰며 추가
-        if len(trajectory_points) >= 2:
-            # 점선 효과: 2개씩 건너뛰며 선분 생성 (dash pattern)
-            dash_segments = []
-            for i in range(0, len(trajectory_points) - 1, 3):  # 3칸마다 1개씩 그림
-                if i + 1 < len(trajectory_points):
-                    # 각 dash는 2-3개 포인트로 구성
-                    end_idx = min(i + 2, len(trajectory_points))
-                    dash_segments.append(trajectory_points[i:end_idx])
-            
-            # 여러 개의 spline을 생성해서 점선 효과
-            self.ego_trajectory_handles = []
-            for idx, dash_points in enumerate(dash_segments):
-                if len(dash_points) >= 2:
-                    handle = self.client.scene.add_spline_catmull_rom(
-                        f"/ego_trajectory/dash_{idx}",
-                        positions=dash_points,
-                        line_width=5.0,  # 두꺼운 선 (2.0 -> 5.0)
-                        color=(255, 0, 0),  # 빨간색
-                        segments=20,  # 각 dash의 부드러움
-                    )
-                    self.ego_trajectory_handles.append(handle)
-            
-            logger.info(f"Added dashed ego trajectory with {len(dash_segments)} segments from {len(trajectory_points)} points")
-        else:
-            logger.warning("Not enough points to create trajectory")
-
-    def _add_ego4d_world_axes(self):
-        """Add Ego4D world coordinate system axes to the scene."""
-        logger.info("Adding Ego4D world coordinate system axes...")
-        
-        ego_extrinsics_list = self.global_context().ego_extrinsics_list
-        exo_cam_to_world = self.global_context().exo_cam_to_world
-        
-        if ego_extrinsics_list is None or exo_cam_to_world is None:
-            logger.warning("Missing ego camera data, skipping Ego4D world axes visualization")
-            return
-
-        # Compute transformation from Ego4D world to ViPE world using exo camera alignment
-        try:
-            current_artifact = self.global_context().artifacts[self.gui_id.value]
-            # Use first ViPE exo camera pose as world alignment reference
-            vipe_c2w_iter = read_pose_artifacts(current_artifact.pose_path)[1].matrix().numpy()
-            vipe_exo_c2w = next(iter(vipe_c2w_iter))
-            ego_exo_c2w = exo_cam_to_world
-            # T_egoWorld_to_vipeWorld maps Ego4D world coords -> ViPE world coords
-            T_egoW_to_vipeW = vipe_exo_c2w @ np.linalg.inv(ego_exo_c2w)
-            logger.info("Computed Ego4D->ViPE world alignment from exo camera poses")
-        except Exception as e:
-            logger.warning(f"Failed to compute Ego4D->ViPE alignment: {e}")
-            return
-        
-        # Ego4D world origin in ViPE world coordinates
-        ego_world_origin_vipe = T_egoW_to_vipeW[:3, 3]
-        
-        # Add Ego4D world coordinate frame
-        ego_world_frame = self.client.scene.add_frame(
-            "/ego4d_world/frame",
-            axes_length=0.05,  # Length of coordinate axes
-            axes_radius=0.005,  # Thickness of coordinate axes
-            origin_radius=0.005,  # Size of origin sphere
-        )
-        
-        # Set the frame position and orientation using the transformation matrix
-        ego_world_frame.wxyz = tf.SO3.from_matrix(T_egoW_to_vipeW[:3, :3]).wxyz
-        ego_world_frame.position = ego_world_origin_vipe
-        
-        logger.info(f"Added Ego4D world coordinate system at origin: {ego_world_origin_vipe}")
-
-    def _add_semidense_point_cloud(self):
-        """Add Ego4D semi-dense point cloud to the scene."""
-        logger.info("Adding Ego4D semi-dense point cloud...")
-        
-        semidense_points = self.global_context().semidense_points
-        ego_extrinsics_list = self.global_context().ego_extrinsics_list
-        exo_cam_to_world = self.global_context().exo_cam_to_world
-        
-        if semidense_points is None:
-            logger.warning("No semi-dense points available, skipping visualization")
-            return
-            
-        if ego_extrinsics_list is None or exo_cam_to_world is None:
-            logger.warning("Missing ego camera data, using semi-dense points in original coordinates")
-            # Use points as-is (already in Ego4D world coordinates)
-            points_vipe = semidense_points
-        else:
-            # Transform semi-dense points from Ego4D world to ViPE world coordinates
-            try:
-                current_artifact = self.global_context().artifacts[self.gui_id.value]
-                # Use first ViPE exo camera pose as world alignment reference
-                vipe_c2w_iter = read_pose_artifacts(current_artifact.pose_path)[1].matrix().numpy()
-                vipe_exo_c2w = next(iter(vipe_c2w_iter))
-                ego_exo_c2w = exo_cam_to_world
-                # T_egoWorld_to_vipeWorld maps Ego4D world coords -> ViPE world coords
-                T_egoW_to_vipeW = vipe_exo_c2w @ np.linalg.inv(ego_exo_c2w)
-                
-                # Transform points to ViPE world coordinates
-                # Add homogeneous coordinate
-                points_homo = np.hstack([semidense_points, np.ones((semidense_points.shape[0], 1))])
-                # Transform points
-                points_vipe_homo = (T_egoW_to_vipeW @ points_homo.T).T
-                points_vipe = points_vipe_homo[:, :3]
-                
-                logger.info("Transformed semi-dense points to ViPE world coordinates")
-            except Exception as e:
-                logger.warning(f"Failed to transform semi-dense points: {e}")
-                points_vipe = semidense_points
-        
-        # Create colors for the points (use a consistent, pale orange color)
-        colors = np.full((points_vipe.shape[0], 3), [0.9, 0.7, 0.5])
-        
-        # Add point cloud to scene
-        self.semidense_pcd_handle = self.client.scene.add_point_cloud(
-            "/semidense_points",
-            points=points_vipe,
-            colors=colors,
-            point_size=0.005,  # Smaller point size (reduced from 0.01 to 0.005)
-        )
-        
-        # Set visibility based on GUI control
-        if hasattr(self, 'gui_show_semidense_pcd') and self.gui_show_semidense_pcd is not None:
-            self.semidense_pcd_handle.visible = self.gui_show_semidense_pcd.value
-        else:
-            self.semidense_pcd_handle.visible = True
-        
-        logger.info(f"Added {points_vipe.shape[0]} semi-dense points to scene")
 
     def _add_manual_ego_camera(self):
         """Add manual ego camera with transform controls."""
@@ -895,22 +631,8 @@ class ClientClosures:
 
         self.client.scene.reset()
         
-        # ! 원래대로 하고 싶으면 밑의 3줄 주석 처리
-        # 크로마키 그린 배경 재설정 (scene.reset()이 배경을 지우므로)
-        # chroma_green_bg = np.zeros((1080, 1920, 3), dtype=np.uint8)
-        # chroma_green_bg[:, :] = [0, 177, 64]
-        # self.client.scene.set_background_image(image=chroma_green_bg, format="png")
-        
         self.client.camera.fov = np.deg2rad(self.gui_fov.value)
         self.scene_frame_handles = []
-        
-        # Add ego camera frustums if take_uuid is provided
-        if (self.global_context().take_uuid is not None and 
-            self.global_context().ego_extrinsics_list is not None and
-            self.global_context().exo_cam_to_world is not None):
-            self._add_ego_camera_frustums()
-            self._add_ego_trajectory()  # Add trajectory visualization
-            self._add_ego4d_world_axes()
         
         # Mean background depth 계산 (use_mean_bg가 true이고 아직 계산되지 않은 경우)
         if use_mean_bg and (self.global_context().mean_depth is None or self.global_context().mean_rgb is None):
@@ -951,20 +673,10 @@ class ClientClosures:
             if frame_idx % temporal_subsample != 0:
                 continue
 
-            # Current frame size (needed for both default and GT paths)
+            # Current frame size
             frame_height, frame_width = rgb.shape[:2]
 
-            # Optionally override with exo GT intrinsics (scaled to current frame size)
-            if self.global_context().use_exo_intrinsic_gt and self.global_context().gt_exo_intrinsics_K is not None and self.global_context().gt_exo_image_size is not None:
-                src_w, src_h = self.global_context().gt_exo_image_size
-                sx = frame_width / float(src_w)
-                sy = frame_height / float(src_h)
-                K = self.global_context().gt_exo_intrinsics_K.copy()
-                K[0, 0] *= sx
-                K[1, 1] *= sy
-                K[0, 2] *= sx
-                K[1, 2] *= sy
-                intr = torch.tensor([K[0, 0], K[1, 1], K[0, 2], K[1, 2]], dtype=torch.float32)
+            # Use ViPE intrinsics
             pinhole_intr = camera_type.build_camera_model(intr).pinhole().intrinsics
             fov = 2 * np.arctan2(frame_height / 2, pinhole_intr[0].item())
 
@@ -1213,225 +925,6 @@ class ClientClosures:
         return _global_context
 
 
-def load_ego_camera_poses(camera_pose_path: str) -> Tuple[np.ndarray, List[np.ndarray]]:
-    """
-    Load ego camera poses from JSON file.
-    
-    Returns:
-        intrinsics: 3x3 camera intrinsics matrix
-        extrinsics_list: List of 3x4 camera extrinsics matrices for each frame (world-to-camera)
-    """
-    with open(camera_pose_path, 'r') as f:
-        data = json.load(f)
-    
-    # Find aria camera (ego view)
-    aria_key = None
-    for key in data.keys():
-        if key.startswith('aria'):
-            aria_key = key
-            break
-    
-    if aria_key is None:
-        raise ValueError("No aria camera found in camera pose file")
-    
-    logger.info(f"Using ego camera: {aria_key}")
-    
-    # Extract camera intrinsics (3x3)
-    intrinsics = np.array(data[aria_key]['camera_intrinsics'])
-    
-    # Extract camera extrinsics for each frame
-    # camera_extrinsics is a dictionary with string keys "0", "1", etc.
-    extrinsics_dict = data[aria_key]['camera_extrinsics']
-    extrinsics_list = []
-    
-    # Get all keys and sort them numerically
-    frame_indices = sorted([int(k) for k in extrinsics_dict.keys()])
-    
-    for frame_idx in frame_indices:
-        # Load as 3x4 matrix from JSON
-        extrinsics = np.array(extrinsics_dict[str(frame_idx)])
-        extrinsics_list.append(extrinsics)
-    
-    logger.info(f"Loaded intrinsics: {intrinsics.shape}")
-    logger.info(f"Loaded {len(extrinsics_list)} extrinsics matrices (W2C - world-to-camera format)")
-    
-    return intrinsics, extrinsics_list
-
-
-def load_exo_camera_pose(exo_camera_pose_path: str, cam_id: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Load exo camera pose from Ego4D trajectory CSV file.
-    
-    Args:
-        exo_camera_pose_path: Path to gopro_calibs.csv file
-        cam_id: Camera ID to extract (required, e.g., 'cam01', 'cam02', 'gp01', 'gp02', etc.)
-    
-    Returns:
-        T_world_to_cam: 4x4 transformation matrix from world to camera coordinates
-        T_cam_to_world: 4x4 transformation matrix from camera to world coordinates
-        camera_center: 3D camera center position in world coordinates
-    """
-    # Read CSV file
-    df = pd.read_csv(exo_camera_pose_path)
-    
-    # Find the camera row
-    cam_row = df[df['cam_uid'] == cam_id]
-    if cam_row.empty:
-        raise ValueError(f"Camera {cam_id} not found in {exo_camera_pose_path}")
-    
-    cam_row = cam_row.iloc[0]
-    
-    # Extract translation and quaternion
-    # Ego-Exo4D CSV format: tx_world_cam, qx_world_cam etc. represent T_cam_to_world (T_wc)
-    tx = cam_row['tx_world_cam']
-    ty = cam_row['ty_world_cam'] 
-    tz = cam_row['tz_world_cam']
-    camera_center = np.array([tx, ty, tz])  # Camera center in world coordinates
-    
-    # Extract quaternion (qx, qy, qz, qw) - rotation from camera to world (R_wc)
-    qx = cam_row['qx_world_cam']
-    qy = cam_row['qy_world_cam']
-    qz = cam_row['qz_world_cam']
-    qw = cam_row['qw_world_cam']
-    quaternion = np.array([qx, qy, qz, qw])
-    
-    # Convert quaternion to rotation matrix (camera to world)
-    R_cam_to_world = R.from_quat(quaternion).as_matrix()
-    
-    # Create camera-to-world transformation (T_wc)
-    T_cam_to_world = np.eye(4)
-    T_cam_to_world[:3, :3] = R_cam_to_world  # Camera to world rotation
-    T_cam_to_world[:3, 3] = camera_center    # Camera center position in world
-    
-    # Create world-to-camera transformation (T_cw = inv(T_wc))
-    T_world_to_cam = np.eye(4)
-    T_world_to_cam[:3, :3] = R_cam_to_world.T  # Inverse rotation (world to camera)
-    T_world_to_cam[:3, 3] = -R_cam_to_world.T @ camera_center  # Proper translation
-    
-    logger.info(f"Loaded exo camera {cam_id} pose from {exo_camera_pose_path}")
-    logger.info(f"Camera center in world: {camera_center}")
-    logger.info(f"Quaternion (cam->world): {quaternion}")
-    
-    return T_world_to_cam, T_cam_to_world, camera_center
-
-
-def load_semidense_points(take_name: str, 
-                         inverse_distance_std_threshold: float = 0.001,
-                         distance_std_threshold: float = 0.15) -> Optional[np.ndarray]:
-    """
-    Load Ego4D semi-dense point cloud using projectaria-tools.
-    
-    Args:
-        take_name: Take name (e.g., 'georgiatech_cooking_01_03_2')
-        inverse_distance_std_threshold: Threshold for inverse distance std filtering
-        distance_std_threshold: Threshold for distance std filtering
-    
-    Returns:
-        points_world: Nx3 array of 3D points in world coordinates, or None if failed
-    """
-    if not PROJECTARIA_AVAILABLE:
-        logger.warning("projectaria-tools not available, skipping semi-dense point cloud loading")
-        return None
-    
-    # Construct path to semi-dense points
-    semidense_path = f"/home/nas_main/kinamkim/DATA/Ego4D/dataset_train/takes/{take_name}/trajectory/semidense_points.csv.gz"
-    
-    try:
-        logger.info(f"Loading semi-dense points from: {semidense_path}")
-        
-        # Load global point cloud using projectaria-tools
-        points = mps.read_global_point_cloud(semidense_path)
-        logger.info(f"Loaded {len(points)} raw semi-dense points")
-        
-        # Filter points based on confidence thresholds
-        filtered_points = filter_points_from_confidence(
-            points, 
-            inverse_distance_std_threshold, 
-            distance_std_threshold
-        )
-        logger.info(f"Filtered to {len(filtered_points)} confident semi-dense points")
-        
-        # Extract 3D positions in world coordinates
-        points_world = np.array([point.position_world for point in filtered_points])
-        logger.info(f"Extracted {points_world.shape[0]} 3D points for visualization")
-        
-        return points_world
-        
-    except Exception as e:
-        logger.error(f"Failed to load semi-dense points: {e}")
-        return None
-
-
-def load_exo_gt_intrinsics_from_camera_pose(take_uuid: str, cam_id: str) -> Tuple[Optional[np.ndarray], Optional[Tuple[int, int]]]:
-    """
-    Load exo camera pinhole intrinsics from camera_pose/{take_uuid}.json.
-    Returns (K 3x3, (width, height)) or (None, None) if not found.
-    """
-    pose_path = f"/home/nas_main/kinamkim/DATA/Ego4D/dataset_train/annotations/ego_pose/train/camera_pose/{take_uuid}.json"
-    try:
-        with open(pose_path, 'r') as f:
-            data = json.load(f)
-        
-        # Check if cam_id exists in the JSON
-        if cam_id not in data:
-            logger.warning(f"Camera {cam_id} not found in camera_pose JSON")
-            return None, None
-        
-        cam_data = data[cam_id]
-        if 'camera_intrinsics' not in cam_data:
-            logger.warning(f"No camera_intrinsics found for {cam_id}")
-            return None, None
-        
-        K = cam_data['camera_intrinsics']
-        
-        # Convert to numpy array
-        if isinstance(K, list) and len(K) == 3 and all(isinstance(row, list) and len(row) == 3 for row in K):
-            K_mat = np.array(K, dtype=float)
-        else:
-            logger.warning(f"Invalid camera_intrinsics format for {cam_id}: {K}")
-            return None, None
-        
-        # For camera_pose JSON, we need to infer the image size from the intrinsics
-        # The cx, cy values typically correspond to the image center
-        cx, cy = K_mat[0, 2], K_mat[1, 2]
-        # Assume standard GoPro resolution (3840x2160) based on cx=1920, cy=1080
-        width, height = int(cx * 2), int(cy * 2)
-        
-        logger.info(f"Loaded GT intrinsics for {cam_id}: fx={K_mat[0,0]:.2f}, fy={K_mat[1,1]:.2f}, cx={cx:.1f}, cy={cy:.1f}, size={width}x{height}")
-        return K_mat, (width, height)
-        
-    except FileNotFoundError:
-        logger.warning(f"camera_pose/{take_uuid}.json not found")
-    except Exception as e:
-        logger.warning(f"Failed to parse camera_pose JSON: {e}")
-    return None, None
-
-
-def parse_camera_id_from_input_dir(input_dir: str) -> str:
-    """
-    Parse camera ID from input directory path.
-    
-    Args:
-        input_dir: Input directory path like 'vipe_results/take_name/cam04_static_vda_fixedcam_slammap' or 'vipe_results/take_name/gp02_static_vda_fixedcam_slammap'
-    
-    Returns:
-        Camera ID string like 'cam04' or 'gp02'
-    """
-    import re
-    
-    # Extract camera ID pattern (cam + 2 digits or gp + 2 digits)
-    pattern = r'(cam\d{2}|gp\d{2})'
-    match = re.search(pattern, input_dir)
-    
-    if match:
-        cam_id = match.group(0)
-        logger.info(f"Parsed camera ID '{cam_id}' from input_dir: {input_dir}")
-        return cam_id
-    else:
-        # No fallback - raise error if camera ID cannot be parsed
-        raise ValueError(f"Could not parse camera ID from input_dir: {input_dir}. Expected format with 'camXX' or 'gpXX' pattern (e.g., cam01, cam02, gp01, gp02, etc.)")
-
-
 def get_host_ip() -> str:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         try:
@@ -1443,7 +936,7 @@ def get_host_ip() -> str:
     return internal_ip
 
 
-def run_viser(base_path: Path, port: int = 20540, use_mean_bg: bool = False, take_uuid: str = None, start_frame: int = None, use_exo_intrinsic_gt: bool = False, ego_manual: bool = False):
+def run_viser(base_path: Path, port: int = 20540, use_mean_bg: bool = False, ego_manual: bool = False):
     # Get list of artifacts.
     logger.info(f"Loading artifacts from {base_path}")
     artifacts: list[ArtifactPath] = list(ArtifactPath.glob_artifacts(base_path, use_video=True))
@@ -1451,150 +944,10 @@ def run_viser(base_path: Path, port: int = 20540, use_mean_bg: bool = False, tak
         logger.error("No artifacts found. Exiting.")
         return
 
-    # Load ego camera data if take_uuid is provided
-    ego_extrinsics_list = None
-    exo_cam_to_world = None
-    
-    if take_uuid is not None and start_frame is not None:
-        logger.info(f"Loading ego camera data for take_uuid: {take_uuid}, start_frame: {start_frame}")
-        
-        try:
-            # Parse camera ID and robustly derive take_name from data path
-            first_artifact = artifacts[0]
-            cam_id = parse_camera_id_from_input_dir(str(first_artifact.base_path))
-            try:
-                bp = base_path if isinstance(base_path, Path) else Path(str(base_path))
-                parts = bp.parts
-                take_name = None
-                # Case 1: find after 'vipe_results'
-                if 'vipe_results' in parts:
-                    idx = parts.index('vipe_results')
-                    if len(parts) > idx + 1:
-                        take_name = parts[idx + 1]
-                # Case 2: user passed camera folder directly like .../{take}/cam02_...
-                if take_name is None:
-                    import re
-                    if re.match(r'^(cam\d{2}|gp\d{2})', bp.name):
-                        take_name = bp.parent.name
-                # Fallback: use artifact parent
-                if take_name is None:
-                    take_name = Path(first_artifact.base_path).parent.name
-            except Exception:
-                take_name = Path(first_artifact.base_path).parent.name
-            logger.info(f"Derived take_name='{take_name}' from data_path='{base_path}'")
-            
-            # Construct paths
-            ego_pose_path = f"/home/nas_main/kinamkim/DATA/Ego4D/dataset_train/annotations/ego_pose/train/camera_pose/{take_uuid}.json"
-            # Exo trajectory path requires take_name (not ego UUID)
-            exo_pose_path = f"/home/nas_main/kinamkim/DATA/Ego4D/dataset_train/takes/{take_name}/trajectory/gopro_calibs.csv"
-            
-            # Load ego camera poses (only extrinsics needed for frustum visualization)
-            _, ego_extrinsics_full = load_ego_camera_poses(ego_pose_path)
-            
-            # Calculate actual number of frames from ViPE artifacts
-            try:
-                # Use the same method as in render_vipe_pointcloud.py
-                pose_inds, _ = read_pose_artifacts(first_artifact.pose_path)
-                num_frames = len(pose_inds)
-                logger.info(f"Detected {num_frames} frames from ViPE artifacts")
-            except Exception as e:
-                logger.warning(f"Failed to read pose artifacts: {e}")
-                # Fallback: count RGB frames
-                try:
-                    rgb_frames = list(read_rgb_artifacts(first_artifact.rgb_path))
-                    num_frames = len(rgb_frames)
-                    logger.info(f"Fallback: detected {num_frames} frames from RGB artifacts")
-                except Exception as e2:
-                    logger.warning(f"Failed to read RGB artifacts: {e2}")
-                    num_frames = 50  # Final fallback
-                    logger.warning(f"Using fallback frame count: {num_frames}")
-            
-            # Slice ego extrinsics based on start_frame and number of frames in artifacts
-            ego_extrinsics_list = ego_extrinsics_full[start_frame:start_frame + num_frames]
-            
-            # Load exo camera pose
-            _, exo_cam_to_world, _ = load_exo_camera_pose(exo_pose_path, cam_id)
-            
-            logger.info(f"Successfully loaded ego camera data: {len(ego_extrinsics_list)} frames")
-            logger.info(f"Successfully loaded exo camera pose for {cam_id}")
-            
-        except Exception as e:
-            logger.warning(f"Failed to load ego camera data: {e}")
-            logger.warning("Continuing without ego camera visualization")
-            take_uuid = None
-            start_frame = None
-
-    # Load semi-dense point cloud if take_uuid is provided
-    semidense_points = None
-    if take_uuid is not None:
-        try:
-            # Extract take_name from base_path
-            bp = base_path if isinstance(base_path, Path) else Path(str(base_path))
-            parts = bp.parts
-            take_name = None
-            # Case 1: find after 'vipe_results'
-            if 'vipe_results' in parts:
-                idx = parts.index('vipe_results')
-                if len(parts) > idx + 1:
-                    take_name = parts[idx + 1]
-            # Case 2: user passed camera folder directly like .../{take}/cam02_...
-            if take_name is None:
-                import re
-                for part in reversed(parts):
-                    if re.match(r'^[a-zA-Z0-9_]+_cooking_\d+_\d+_\d+$', part):
-                        take_name = part
-                        break
-            
-            if take_name:
-                logger.info(f"Loading semi-dense point cloud for take: {take_name}")
-                semidense_points = load_semidense_points(take_name)
-                if semidense_points is not None:
-                    logger.info(f"Successfully loaded {semidense_points.shape[0]} semi-dense points")
-                else:
-                    logger.warning("Failed to load semi-dense points")
-            else:
-                logger.warning("Could not extract take_name for semi-dense point loading")
-                
-        except Exception as e:
-            logger.warning(f"Failed to load semi-dense points: {e}")
-
-    # Load exo GT intrinsics if requested
-    gt_K = None
-    gt_size = None
-    if use_exo_intrinsic_gt:
-        try:
-            # Derive take_name and cam_id as above
-            first_artifact = artifacts[0]
-            cam_id = parse_camera_id_from_input_dir(str(first_artifact.base_path))
-            bp = base_path if isinstance(base_path, Path) else Path(str(base_path))
-            parts = bp.parts
-            take_name = None
-            if 'vipe_results' in parts:
-                idx = parts.index('vipe_results')
-                if len(parts) > idx + 1:
-                    take_name = parts[idx + 1]
-            if take_name is None:
-                take_name = Path(first_artifact.base_path).parent.name
-            gt_K, gt_size = load_exo_gt_intrinsics_from_camera_pose(take_uuid, cam_id)
-            if gt_K is not None:
-                logger.info(f"Loaded exo GT intrinsics from camera_pose.json with size {gt_size}")
-            else:
-                logger.warning("Failed to find exo GT intrinsics in camera_pose.json; will use ViPE intrinsics")
-        except Exception as e:
-            logger.warning(f"Failed to load exo GT intrinsics: {e}")
-
     global _global_context
     _global_context = GlobalContext(
         artifacts=sorted(artifacts, key=lambda x: x.artifact_name),
         use_mean_bg=use_mean_bg,
-        use_exo_intrinsic_gt=use_exo_intrinsic_gt,
-        take_uuid=take_uuid,
-        start_frame=start_frame,
-        ego_extrinsics_list=ego_extrinsics_list,
-        exo_cam_to_world=exo_cam_to_world,
-        semidense_points=semidense_points,
-        gt_exo_intrinsics_K=gt_K,
-        gt_exo_image_size=gt_size,
         ego_manual=ego_manual
     )
 
@@ -1639,27 +992,13 @@ def main():
         help="Use nanmean background instead of standard background"
     )
     parser.add_argument(
-        "--take_uuid",
-        type=str,
-        help="Take UUID for ego camera pose visualization (optional)"
-    )
-    parser.add_argument(
-        "--start_frame",
-        type=int,
-        help="Start frame for ego camera pose visualization (required if --take_uuid is provided)"
-    )
-    parser.add_argument(
         "--ego_manual",
         action="store_true",
         help="Enable manual ego camera control with transform handles"
     )
     args = parser.parse_args()
 
-    # Validate that start_frame is provided if take_uuid is provided
-    if args.take_uuid is not None and args.start_frame is None:
-        parser.error("--start_frame is required when --take_uuid is provided")
-
-    run_viser(args.base_path, args.port, args.use_mean_bg, args.take_uuid, args.start_frame, False, args.ego_manual)
+    run_viser(args.base_path, args.port, args.use_mean_bg, args.ego_manual)
 
 
 if __name__ == "__main__":

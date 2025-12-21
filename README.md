@@ -1,17 +1,36 @@
-# Ego View Rendering from ViPE Results
+# EgoX EgoPrior Rendering from ViPE Results
 
-ViPE provides point cloud rendering functionality to visualize the 3D reconstruction results. This is particularly useful for analyzing the spatial structure and quality of the estimated depth maps and camera poses.
+**This codebase provides tools to generate ego prior videos for `EgoX`. For the EgoX model itself, please refer to the [EgoX](https://github.com/DAVIAN-Robotics/EgoX/) GitHub repository.**
 
-### Prerequisites
+`ViPE` provides point cloud rendering functionality to visualize the 3D reconstruction results. This is particularly useful for analyzing the spatial structure and quality of the estimated depth maps and camera poses.
+
+## 👀 Installation
+
+To ensure the reproducibility, we recommend creating the runtime environment using [conda](https://docs.conda.io/projects/conda/en/latest/user-guide/getting-started.html).
+
+```bash
+# Create a new conda environment and install 3rd-party dependencies
+conda env create -f envs/base.yml
+conda activate egox-egoprior
+pip install -r envs/requirements.txt
+pip install "git+https://github.com/facebookresearch/pytorch3d.git@v0.7.9" --no-build-isolation
+pip install git+https://github.com/microsoft/MoGe.git
+
+# Build the project and install it into the current environment
+# Omit the -e flag to install the project as a regular package
+pip install --no-build-isolation -e .
+```
+
+## 👀 Prerequisites
 
 Before running the rendering commands, ensure you have completed the ViPE inference on your video using the provided script:
 
 ```bash
-# First, run ViPE inference using the batch script
+# First, run ViPE inference
 ./scripts/infer_vipe.sh
-# Or use the script with GT intrinsics support(example):
-./scripts/infer_all_cooking_with_exo_intr_gt_svda.sh
 ```
+
+### ViPE Inference Arguments
 
 The scripts run ViPE inference with various parameters. Below are the key CLI arguments used:
 
@@ -19,22 +38,55 @@ The scripts run ViPE inference with various parameters. Below are the key CLI ar
 
 - `--start_frame <int>`: Starting frame number (default: 0)
 - `--end_frame <int>`: Ending frame number (inclusive, default: process all frames)
-- `--assume_fixed_camera_pose`: Flag to assume camera pose is fixed throughout the video
-- `--pipeline <str>`: Pipeline configuration to use (default: "default")
+- `--assume_fixed_camera_pose`: Flag to assume camera pose is fixed throughout the video (⚠️ Since `EgoX` is trained on the Ego-Exo4D dataset where exocentric view camera poses are fixed, you must provide exocentric videos with fixed camera poses as input during inference)
+- `--pipeline <str>`: Pipeline configuration to use (we used `lyra` for `EgoX`)
   - Available pipelines: `default`, `lyra`, `lyra_no_vda`, `no_vda`, etc.
   - `default`: Uses UniDepthV2 for depth estimation
   - `lyra`: Uses MoGE2 for depth estimation with VDA enabled for better temporal depth consistency
   - `lyra_no_vda` / `no_vda`: Disables Video Depth Anything (VDA) for reduced GPU memory usage
 
-- `--use_exo_intrinsic_gt <take_uuid>`: Use ground truth exocentric camera intrinsics instead of ViPE-estimated intrinsics
-  - Takes a `take_uuid` (string) as argument
+- `--use_exo_intrinsic_gt "<intrinsics_matrix>"`: Use ground truth exocentric camera intrinsics instead of ViPE-estimated intrinsics (e.g., when GT intrinsics are known such as Ego-Exo4D)
+  - Takes a 3x3 intrinsics matrix in JSON format: `[[fx, 0, cx], [0, fy, cy], [0, 0, 1]]`
   - Automatically sets `optimize_intrinsics=False` when provided
-  - **⚠️ IMPORTANT**: Loads intrinsics from Ego4D camera pose JSON. The path is currently hardcoded in `GTIntrinsicsProcessor`. **You must modify the path in `vipe/pipeline/processors.py` to match your environment before using this option.**
   - The GT intrinsics are scaled based on current frame resolution (using cy ratio)
-  - Example: `--use_exo_intrinsic_gt "18e2cf60-65f4-4715-91e0-3917deb5daa8"`
-  - When used, the output directory name will have `_exo_intr_gt` suffix appended
+  - Example: `--use_exo_intrinsic_gt "[[1000.0,0,960.0],[0,1000.0,540.0],[0,0,1]]"`
 
-### Rendering with Scripts
+### Visualizing ViPE Results
+
+After ViPE inference, you can visualize the results using the built-in visualization tool:
+
+```bash
+vipe visualize vipe_results/YOUR_VIPE_RESULT
+```
+
+#### Visualization Options
+
+- `--port <int>`: Server port (default: 20540)
+- `--use_mean_bg`: Use mean background for visualization (Since EgoX is trained with fixed exocentric camera poses, this option helps visualize cleaner point clouds for static objects)
+- `--ego_manual`: **Enable manual ego trajectory annotation mode**. Use this option when you want to obtain ego trajectory directly from in-the-wild videos. 
+  
+  **Manual annotation workflow:**
+  1. For each frame, position the ego camera frustum to align with the appropriate head pose in the 3D view
+  2. Register the positioned frustum using the UI panel in the top-right corner
+  3. Repeat for all frames to build the complete ego trajectory
+  4. See **Appendix Fig. 8** in the paper for examples of frustum positioning aligned with head poses
+
+  **Important Note for In-the-Wild Videos:**
+  
+  Since ego trajectories are manually annotated for in-the-wild videos, the final rendering results can vary significantly depending on how you position the ego camera frustums. Different annotation strategies may lead to different visual perspectives in the rendered ego-view videos.
+
+  Below is a comparison showing two different ego trajectory annotations for the same video (Ironman scene):
+
+  | Version 1 | Version 2 |
+  |-----------|-----------|
+  | ![Ironman Ver1](assets/ironman_ver1.png) | ![Ironman Ver2](assets/ironman_ver2.png) |
+
+The visualization tool provides an interactive 3D viewer where you can:
+- Inspect point clouds and camera poses
+- Validate depth map quality
+- Manually annotate ego trajectories for in-the-wild videos (with `--ego_manual` flag)
+
+## 👀 Ego Prior Rendering
 
 For convenient batch processing, use the provided rendering script:
 
@@ -42,225 +94,102 @@ For convenient batch processing, use the provided rendering script:
 ./scripts/render_vipe.sh
 ```
 
-This script executes the point cloud rendering with multiple parameters configured for Ego4D dataset processing:
+This script executes the point cloud rendering with the following configuration:
 
 - `--input_dir`: ViPE inference results directory
 - `--out_dir`: Output directory for rendered results
-- `--ego_camera_pose_path`: Ego camera pose JSON file
-- `--exo_camera_pose_path`: Exocentric camera calibration CSV
-- `--online_calibration_path`: Online calibration data
+- `--meta_json_path`: JSON file which include camera parameters
 - `--point_size`: Point cloud visualization size
 - `--start_frame`/`--end_frame`: Frame range (both inclusive)
 - `--fish_eye_rendering`: Enables fish-eye distortion rendering
 - `--use_mean_bg`: Uses mean background for rendering
 - `--only_bg`: Renders only the background point clouds (exclude dynamic instance's point clouds)
 
-The script also supports multi-GPU parallel processing and can be configured by modifying the experiment settings within the script.
+### Camera Parameters Format
+
+The `meta.json` file should contain camera intrinsics and extrinsics in the following format:
+
+```json
+{
+  "test_datasets": [
+    {
+      "exo_path": "./example/in_the_wild/videos/joker/exo.mp4",
+      "ego_prior_path": "./example/in_the_wild/videos/joker/ego_Prior.mp4",
+      "camera_intrinsics": [[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
+      "camera_extrinsics": [[r11, r12, r13, tx], [r21, r22, r23, ty], [r31, r32, r33, tz]],
+      "ego_intrinsics": [[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
+      "ego_extrinsics": [
+        [[r11, r12, r13, tx], [r21, r22, r23, ty], [r31, r32, r33, tz]],
+        ...
+      ]
+    }
+  ]
+}
+```
+
+All extrinsics matrices are in world-to-camera format (3x4). The script will automatically convert them to 4x4 format by adding `[0, 0, 0, 1]` as the last row.
 
 ### Manual Rendering Command
 
 For manual execution or custom configurations, you can also run the rendering script directly:
 
 ```bash
-python ego_view_rendering/render_vipe_pointcloud.py \
+python scripts/render_vipe_pointcloud.py \
   --input_dir vipe_results/YOUR_VIDEO_NAME \
+  --meta_json_path /path/to/meta.json \
+  --out_dir /path/to/output \
   --start_frame 0 \
   --end_frame 100 \
-  --out_dir ego_view_rendering \
-  --point_size 1.5 \
+  --point_size 5.0 \
   --fish_eye_rendering \
   --use_mean_bg
 ```
 
 ### Output Structure
 
-The rendered results will be saved in the following structure:
+The rendered results will be saved as MP4 videos (30 FPS) in the following structure:
 ```
-ego_view_rendering/
-├── cmu_bike01_2/
-│   └── cam02/
-│       ├── test_output_pts1.0/
-│       ├── test_output_static_vda_fixedcam_fisheye_pts1.0/
-│       ├── test_output_static_vda_fixedcam_mean_bg_fisheye_pts1.5/
-│       └── test_output_static_vda_fixedcam_slammap_fisheye_pts0.5/
-│       ```
-├── fair_cooking_05_2/
-├── georgiatech_cooking_01_01_2/
-├── iiith_cooking_01_1/
-├── indiana_cooking_01_2/
-├── minnesota_cooking_010_2/
-├── nus_cooking_06_2/
-├── sfu_cooking015_2/
-└── uniandes_cooking_001_10/
+example/egoexo4D/videos/
+├── cmu_soccer_06_6_877_925/
+│   ├── ego_Prior.mp4
+│   └── exo.mp4
+├── iiith_cooking_57_2_2451_2499/
+│   ├── ego_Prior.mp4
+│   └── exo.mp4
+├── sfu_basketball014_4_1000_1048/
+│   ├── ego_Prior.mp4
+│   └── exo.mp4
+└── ...
 ```
 
-Each experiment directory contains multiple output subdirectories with different rendering configurations (pipeline type, point size, background settings, etc.).
+Each result is saved in a directory named after the input ViPE result (e.g., `vipe_results/joker` → `joker/ego_prior.mp4`).
 
-### Common Issues and Solutions
+## 👀 Converting Depth Maps for EgoX Model
 
-**Issue**: `ValueError: No valid camera ID found in directory`
-- **Solution**: Ensure your inference results contain properly formatted camera data
+After ViPE inference, you need to convert the depth maps from `.zip` archives (containing `.exr` files) to `.npy` format that the EgoX model can process:
 
-**Issue**: `Frame range [X, Y] exceeds available inference results [START_FRAME, END_FRAME]`
-- **Solution**: Check the available frame range in your inference results (which corresponds to the start_frame and end_frame used during inference) and adjust `--start_frame` and `--end_frame` accordingly
+```bash
+python scripts/convert_depth_zip_to_npy.py \
+  --depth_path {EgoX_path}/vipe_results/YOUR_VIDEO/depth \
+  --egox_depthmaps_path {EgoX_path}/example/egoexo4D/depth_maps
+```
 
-**Issue**: Missing pose or depth data
-- **Solution**: Verify that ViPE inference completed successfully and generated all necessary output files (`pose/*.npz`, `depth/*.npy`)
+This script will:
+- Extract all `.exr` depth maps from the zip archive(s) in the specified directory
+- Convert them to `.npy` format
+- Save them to `{egox_depthmaps_path}/{zip_filename}/` directory structure
 
-### Performance Tips
+**Note**: This conversion step is independent of EgoPrior rendering and is specifically required as a preprocessing step before feeding data into the EgoX model.
 
-- For large videos, consider processing smaller frame ranges to reduce memory usage and processing time
-- The rendering quality depends on the depth estimation quality from the original ViPE inference
+## Performance Tips
+- **Tuning ViPE inference**: You can adjust temporal and spatial consistency in ViPE inference results by:
+  - Changing the underlying models used internally by ViPE (e.g., switching depth estimation models)
+  - Adjusting model sizes (e.g., using larger models for better quality or smaller models for faster processing)
+  - Modifying pipeline configurations to balance between temporal consistency and 3D spatial consistency
 - Use the visualization tools (`vipe visualize`) to preview results before running extensive rendering jobs
+- The rendering quality depends on the depth estimation quality from the original ViPE inference
 
-<br/><br/><br/>
+## 🙏 Acknowledgements
 
+This `EgoX`'s ego prior rendering project is built upon the `ViPE`(Video Pose Engine) project. We gratefully acknowledge their excellent work in video pose estimation and depth map generation. For more details, please visit the [ViPE](https://github.com/nv-tlabs/vipe) GitHub repository.
 
-<br/>
-
-# ViPE: Video Pose Engine for Geometric 3D Perception
-
-<p align="center">
-  <img src="assets/teaser.gif" alt="teaser"/>
-</p>
-
-**TL;DR: ViPE is a useful open-source spatial AI tool for annotating camera poses and dense depth maps from raw videos!**
-
-**Contributors**: NVIDIA (Spatial Intelligence Lab, Dynamic Vision Lab, NVIDIA Issac, NVIDIA Research).
-
-**Full Abstract**: Accurate 3D geometric perception is an important prerequisite for a wide range of spatial AI systems. While state-of-the-art methods depend on large-scale training data, acquiring consistent and precise 3D annotations from in-the-wild videos remains a key challenge. In this work, we introduce ViPE, a handy and versatile video processing engine designed to bridge this gap. ViPE efficiently estimates camera intrinsics, camera motion, and dense, near-metric depth maps from unconstrained raw videos. It is robust to diverse scenarios, including dynamic selfie videos, cinematic shots, or dashcams, and supports various camera models such as pinhole, wide-angle, and 360° panoramas. 
-We use ViPE to annotate a large-scale collection of videos. This collection includes around 100K real-world internet videos, 1M high-quality AI-generated videos, and 2K panoramic videos, totaling approximately 96M frames -- all annotated with accurate camera poses and dense depth maps. We open source ViPE and the annotated dataset with the hope to accelerate the development of spatial AI systems.
-
-**[Technical Whitepaper](https://research.nvidia.com/labs/toronto-ai/vipe/assets/paper.pdf), [Project Page](https://research.nvidia.com/labs/toronto-ai/vipe), [Dataset](#downloading-the-dataset)**
-
-## Installation
-
-To ensure the reproducibility, we recommend creating the runtime environment using [conda](https://docs.conda.io/projects/conda/en/latest/user-guide/getting-started.html).
-
-```bash
-# Create a new conda environment and install 3rd-party dependencies
-conda env create -f envs/base.yml
-conda activate vipe
-pip install -r envs/requirements.txt
-
-# Build the project and install it into the current environment
-# Omit the -e flag to install the project as a regular package
-pip install --no-build-isolation -e .
-```
-
-## Usage
-
-### Using the ViPE CLI
-
-Once the python package is installed, you can use the `vipe` CLI to process raw videos in mp4 format.
-
-```bash
-# Replace YOUR_VIDEO.mp4 with the path to your video. We provide sample videos in assets/examples.
-vipe infer YOUR_VIDEO.mp4
-# Additional options:
-#   --output: Output directory (default: vipe_results)
-#   --visualize: Enable visualization of intermediate and final results (default: false)
-#   --pipeline: Pipeline configuration to use (default: default)
-```
-
-![vipe-vis](assets/vipe-vis.gif)
-
-One can visualize the results that ViPE produces by running (supported by `viser`):
-```bash
-vipe visualize vipe_results/
-# Please modify the above vipe_results/ path to the output directory of your choice.
-```
-
-![vipe-viser](assets/vipe-viser.gif)
-
-> We found that running [video-depth-anything](https://github.com/DepthAnything/Video-Depth-Anything) might eat up too much of GPU memory. To that end we provide a `no_vda` config that produces less temporally-stable depth (but empirically more 3D consistent) maps. This can be triggered by adding `--pipeline no_vda` to the `vipe infer` command.
-
-### Using the `run.py` script
-
-The `run.py` script is a more flexible way to run ViPE. Compared to the CLI, the script supports running on multiple videos at once and allows more fine-grained control over the pipeline with `hydra` configs. It also provides an example of using `vipe` as a library in your own project.
-
-Example usages:
-
-```bash
-# Running the full pipeline.
-python run.py pipeline=default streams=raw_mp4_stream streams.base_path=YOUR_VIDEO_OR_DIR_PATH
-
-# Running the pose-only pipeline without depth estimation.
-python run.py pipeline=default streams=raw_mp4_stream streams.base_path=YOUR_VIDEO_OR_DIR_PATH pipeline.post.depth_align_model=null
-```
-
-### Converting to COLMAP format
-
-You can use the following script to convert the ViPE results to COLMAP format. For example:
-```bash
-python scripts/vipe_to_colmap.py vipe_results/ --sequence dog_example
-```
-This will unproject the dense depth maps to create the 3D point cloud. 
-Alternatively for a more lightweight and 3D consistent point cloud, you can add the `--use_slam_map` flag to the above command. This requires you to run the full pipeline with `pipeline.output.save_slam_map=true` to save the additional information.
-
-## Downloading the Dataset
-
-![dataset](assets/dataset.gif)
-
-Together with ViPE we release a large-scale dataset containing ~1M high-quality videos with accurate camera poses and dense depth maps. Specifications of the datasets are listed below:
-
-| Dataset Name   | # Videos | # Frames | Hugging Face Link                                            | License      | Prefix |
-| -------------- | -------- | -------- | ------------------------------------------------------------ | ------------ | ------ |
-| Dynpose-100K++ | 99,501   | 15.8M    | [Link](https://huggingface.co/datasets/nvidia/vipe-dynpose-100kpp) | CC-BY-NC 4.0 | `dpsp` |
-| Wild-SDG-1M    | 966,448  | 78.2M    | [Link](https://huggingface.co/datasets/nvidia/vipe-wild-sdg-1m) | CC-BY-NC 4.0 | `wsdg` |
-| Web360         | 2,114    | 212K     | [Link](https://huggingface.co/datasets/nvidia/vipe-web360)   | CC-BY 4.0    | `w360` |
-
-You can download the datasets using the following utility script:
-
-```bash
-# Replace YOUR_PREFIX with the prefix of the dataset to be downloaded (see prefix column in the table above)
-# You can also use more specific prefixes, e.g. wsdg-003e2c86 to download a specific shard of the dataset.
-python scripts/download_dataset.py --prefix YOUR_PREFIX --output_base YOUR_OUTPUT_DIR --rgb --depth
-```
-
-> Note that the depth component is very large and you might expect a long downloading time. For `rgb` component of the Dynpose-100K++ dataset, we directly retrieve the RGB frames from YouTube. You have to `pip install yt_dlp ffmpeg-python` to use this feature. Please refer to the original [Dynpose-100K dataset](https://huggingface.co/datasets/nvidia/dynpose-100k) for alternative approaches to retrieve the videos.
-
-The dataset itself can be visualized using the same visualization script:
-```bash
-vipe visualize YOUR_OUTPUT_DIR
-```
-
-## Acknowledgments
-
-ViPE is built on top of many great open-source research projects and codebases. Some of these include (not exhaustive):
-- [DROID-SLAM](https://github.com/princeton-vl/DROID-SLAM)
-- [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2)
-- [Metric3Dv2](https://github.com/YvanYin/Metric3D)
-- [PriorDA](https://github.com/SpatialVision/Prior-Depth-Anything)
-- [UniDepth](https://github.com/lpiccinelli-eth/UniDepth)
-- [VideoDepthAnything](https://github.com/DepthAnything/Video-Depth-Anything)
-- [GeoCalib](https://github.com/cvg/GeoCalib)
-- [Segment and Track Anything](https://github.com/z-x-yang/Segment-and-Track-Anything)
-
-Please refer to the [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for a full list of projects and their licenses.
-
-We thank useful discussions from Aigul Dzhumamuratova, Viktor Kuznetsov, Soha Pouya, and Ming-Yu Liu, as well as release support from Vishal Kulkarni.
-
-## TODO
-
-- [x] Initial code released under Apache 2.0 license.
-- [x] Full dataset uploaded to Hugging Face for download.
-- [ ] Add instructions to run inference on wide-angle and 360° videos.
-- [ ] Add instructions for benchmarking.
-
-## Citation
-
-If you find ViPE useful in your research or application, please consider citing the following whitepaper:
-
-```
-@inproceedings{huang2025vipe,
-    title={ViPE: Video Pose Engine for 3D Geometric Perception},
-    author={Huang, Jiahui and Zhou, Qunjie and Rabeti, Hesam and Korovko, Aleksandr and Ling, Huan and Ren, Xuanchi and Shen, Tianchang and Gao, Jun and Slepichev, Dmitry and Lin, Chen-Hsuan and Ren, Jiawei and Xie, Kevin and Biswas, Joydeep and Leal-Taixe, Laura and Fidler, Sanja},
-    booktitle={NVIDIA Research Whitepapers arXiv:2508.10934},
-    year={2025}
-}
-```
-
-## License
-
-This project will download and install additional third-party **models and softwares**. Note that these models or softwares are not distributed by NVIDIA. Review the license terms of these models and projects before use. This source code is released under the [Apache 2 License](https://www.apache.org/licenses/LICENSE-2.0).

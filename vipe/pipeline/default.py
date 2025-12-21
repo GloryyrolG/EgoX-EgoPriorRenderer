@@ -51,32 +51,21 @@ class DefaultAnnotationPipeline(Pipeline):
         self.post_cfg = post
         self.out_cfg = output
         self.assume_fixed_camera_pose = assume_fixed_camera_pose
-        self.use_exo_intrinsic_gt = use_exo_intrinsic_gt
         
-        # Modify output path based on depth_align_model
+        # Parse intrinsics matrix from JSON string if provided
+        if use_exo_intrinsic_gt is not None:
+            import json
+            try:
+                self.use_exo_intrinsic_gt = json.loads(use_exo_intrinsic_gt)
+                logger.info(f"Parsed GT intrinsics matrix: {self.use_exo_intrinsic_gt}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse intrinsics matrix: {e}")
+                raise ValueError(f"Invalid intrinsics matrix format: {use_exo_intrinsic_gt}")
+        else:
+            self.use_exo_intrinsic_gt = None
+        
+        # Use output path as-is without any suffix modifications
         output_path = Path(self.out_cfg.path)
-        depth_align_model = self.post_cfg.depth_align_model
-
-        if depth_align_model == "adaptive_unidepth-l_vda":
-            output_path = output_path.parent / f"{output_path.name}_static_vda"
-        elif depth_align_model == "adaptive_unidepth-l":
-            output_path = output_path.parent / f"{output_path.name}_no_vda"
-        elif depth_align_model == "adaptive_unidepth-l_metric-vda":
-            output_path = output_path.parent / f"{output_path.name}_metric_vda"
-        elif depth_align_model == "adaptive_moge_vda":
-            output_path = output_path.parent / f"{output_path.name}_moge_static_vda"
-        elif depth_align_model == "adaptive_moge":
-            output_path = output_path.parent / f"{output_path.name}_moge_no_vda"
-
-        # Add _fixedcam suffix to the output directory name
-        if self.assume_fixed_camera_pose:
-            output_path = output_path.parent / (output_path.name + "_fixedcam")
-        # Add _slammap suffix when save_slam_map is enabled in output config
-        if getattr(self.out_cfg, "save_slam_map", False):
-            output_path = output_path.parent / (output_path.name + "_slammap")
-        # Add _use_gt_intrinsic suffix when GT intrinsics are used
-        if self.use_exo_intrinsic_gt is not None:
-            output_path = output_path.parent / (output_path.name + "_exo_intr_gt")
         
         self.out_path = output_path
         self.out_path.mkdir(exist_ok=True, parents=True)
@@ -94,59 +83,11 @@ class DefaultAnnotationPipeline(Pipeline):
         assert FrameAttribute.METRIC_DEPTH not in video_stream.attributes()
         assert FrameAttribute.INSTANCE not in video_stream.attributes()
 
-        # Use GT intrinsics processor if take_uuid is provided, otherwise use GeoCalib
+        # Use GT intrinsics processor if intrinsics matrix is provided, otherwise use GeoCalib
         if self.use_exo_intrinsic_gt is not None:
-            # Parse take_name and start_frame from video path if camera is exo_GT
-            take_name = None
-            start_frame = None
-            
-            logger.info(f"Video stream name: {video_stream.name()}")
-            logger.info(f"Video stream type: {type(video_stream)}")
-            
-            if video_stream.name() == "exo_GT":
-                # Need to get video path from the underlying stream
-                # Unwrap ProcessedVideoStream to get to RawMp4Stream
-                current_stream = video_stream
-                logger.info(f"Starting unwrap from {type(current_stream)}")
-                
-                while hasattr(current_stream, 'stream'):
-                    current_stream = current_stream.stream
-                    logger.info(f"Unwrapped to {type(current_stream)}")
-                
-                logger.info(f"Final stream type: {type(current_stream)}")
-                logger.info(f"Has path attribute: {hasattr(current_stream, 'path')}")
-                
-                # Now current_stream should be RawMp4Stream which has .path attribute
-                if hasattr(current_stream, 'path'):
-                    from pathlib import Path
-                    video_path = Path(current_stream.path)
-                    logger.info(f"Video path: {video_path}")
-                    
-                    # Get the 4th parent directory name which contains {take_name}_{start_frame}_{end_frame}
-                    # Example: uniandes_cooking_008_8_1000_1048
-                    take_dir = video_path.parents[3].name
-                    logger.info(f"Take dir: {take_dir}")
-                    
-                    # Parse: split from right by '_', max 2 splits to get [take_name, start_frame, end_frame]
-                    parts = take_dir.rsplit('_', 2)
-                    logger.info(f"Parts: {parts}")
-                    if len(parts) == 3:
-                        take_name = parts[0]
-                        start_frame = int(parts[1])
-                        logger.info(f"Parsed from video path: take_name={take_name}, start_frame={start_frame}")
-                    else:
-                        logger.warning(f"Failed to parse take_dir '{take_dir}' into 3 parts")
-                else:
-                    logger.warning(f"Current stream does not have 'path' attribute")
-            else:
-                logger.info(f"Video stream name is not 'exo_GT', skipping path parsing")
-            
             init_processors.append(GTIntrinsicsProcessor(
-                video_stream, 
-                take_uuid=self.use_exo_intrinsic_gt, 
-                camera_type=self.camera_type,
-                take_name=take_name,
-                start_frame=start_frame
+                intrinsics_matrix=self.use_exo_intrinsic_gt, 
+                camera_type=self.camera_type
             ))
         else:
             init_processors.append(GeoCalibIntrinsicsProcessor(video_stream, camera_type=self.camera_type))

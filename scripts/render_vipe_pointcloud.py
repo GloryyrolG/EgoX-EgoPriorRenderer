@@ -124,298 +124,50 @@ def scale_intrinsics(*args):
     else:
         return new_fx, new_cx, new_cy
 
-def check_coordinate_system_consistency(T_cam_to_world, ego_intrinsics, ego_extrinsics_list, 
-                                      global_points, csv_camera_center, image_size=(448, 448),
-                                      is_fisheye: bool = False, online_calibration_path: Optional[str] = None,
-                                      original_image_size: Optional[Tuple[int, int]] = None,
-                                      cam_id: str = "exo_camera"):
-    """
-    Check coordinate system consistency to catch transformation errors.
-    
-    Args:
-        T_cam_to_world: Transformation matrix from exo camera to Ego4D world
-        ego_intrinsics: 3x3 ego camera intrinsics matrix
-        ego_extrinsics_list: List of ego camera extrinsics (C2W)
-        global_points: Global point cloud in world coordinates
-        csv_camera_center: Camera center from CSV file
-        image_size: Target image size (height, width)
-        is_fisheye: Whether to use fish-eye rendering
-        online_calibration_path: Path to online calibration file
-        original_image_size: Original image size for consistency check
-        cam_id: Camera ID for logging (e.g., 'cam01', 'cam02', 'gp01', 'gp02', etc.)
-        is_fisheye: Flag to indicate if fish-eye checks should be used
-        online_calibration_path: Path to calibration file for fish-eye intrinsics
-        original_image_size: (H, W) of the original camera sensor, for scaling intrinsics
-    """
-    logger.info("=" * 60)
-    logger.info("COORDINATE SYSTEM CONSISTENCY CHECKS")
-    logger.info("=" * 60)
-    
-    # 1. Exo camera 정합성 체크
-    logger.info("1. Exo Camera Consistency Check:")
-    vipe_origin = np.array([0, 0, 0, 1])  # ViPE world origin (homogeneous)
-    transformed_origin = T_cam_to_world @ vipe_origin
-    transformed_center = transformed_origin[:3]
-    
-    logger.info(f"   ViPE origin [0,0,0] transformed to Ego4D: {transformed_center}")
-    logger.info(f"   CSV exo camera center: {csv_camera_center}")
-    
-    distance_error = np.linalg.norm(transformed_center - csv_camera_center)
-    logger.info(f"   Distance error: {distance_error:.6f}")
-    
-    if distance_error < 0.01:
-        logger.info(f"   ✅ {cam_id} transformation looks CORRECT")
-    else:
-        logger.warning(f"   ❌ {cam_id} transformation ERROR - distance {distance_error:.6f} too large")
-    
-    # 2. Ego extrinsics 부호 체크
-    logger.info("\n2. Ego Extrinsics Sign Check:")
-    if len(ego_extrinsics_list) > 0 and len(global_points) > 0:
-        # Take a middle frame for testing
-        test_frame_idx = min(len(ego_extrinsics_list) // 2, 30)
-        test_extrinsics = ego_extrinsics_list[test_frame_idx]
-        
-        # Convert to 4x4 matrix (ego_extrinsics is already W2C)
-        T_w2c = np.eye(4)
-        T_w2c[:3, :] = test_extrinsics
-        T_c2w = np.linalg.inv(T_w2c)
-        
-        # Get camera position for proximity-based filtering
-        camera_pos = T_c2w[:3, 3]
-        
-        # Filter points that are close to camera (more likely to be in FOV)
-        distances = np.linalg.norm(global_points - camera_pos, axis=1)
-        close_mask = distances < np.percentile(distances, 20)  # Closest 20% of points
-        close_points = global_points[close_mask]
-        
-        if len(close_points) > 100:
-            # Sample from close points (more likely to be in FOV)
-            sample_size = min(500, len(close_points))
-            sample_indices = np.random.choice(len(close_points), sample_size, replace=False)
-            sample_points = close_points[sample_indices]
-            point_source = "close"
-        else:
-            # Fallback to all points if not enough close points
-            sample_size = min(1000, len(global_points))
-            sample_indices = np.random.choice(len(global_points), sample_size, replace=False)
-            sample_points = global_points[sample_indices]
-            point_source = "all"
-        
-        # Transform world points to camera coordinates
-        points_homogeneous = np.hstack([sample_points, np.ones((len(sample_points), 1))])
-        points_camera = (T_w2c @ points_homogeneous.T).T[:, :3]
-        
-        # Check z-coordinate distribution
-        z_coords = points_camera[:, 2]
-        z_positive_count = np.sum(z_coords > 0)
-        z_negative_count = np.sum(z_coords < 0)
-        z_positive_ratio = z_positive_count / len(z_coords)
-        
-        logger.info(f"   Test frame: {test_frame_idx}")
-        logger.info(f"   Camera position: {camera_pos}")
-        logger.info(f"   Using {len(sample_points)} sample points (from {point_source} points)")
-        logger.info(f"   Points in front (z > 0): {z_positive_count}/{len(z_coords)} ({z_positive_ratio:.1%})")
-        logger.info(f"   Points behind (z < 0): {z_negative_count}/{len(z_coords)} ({100-z_positive_ratio*100:.1%})")
-        logger.info(f"   Z-coordinate range: [{z_coords.min():.3f}, {z_coords.max():.3f}]")
-        
-        # More lenient threshold for ego camera (10% instead of 30%)
-        if z_positive_ratio > 0.1:  # At least 10% points should be in front
-            logger.info("   ✅ Ego extrinsics sign looks REASONABLE for ego camera view")
-        else:
-            logger.warning("   ❌ Ego extrinsics sign ERROR - too few points in front of camera")
-    else:
-        logger.warning("   ⚠️  Cannot check ego extrinsics - no data available")
-    
-    # 3. FOV/Principal point sanity check
-    logger.info("\n3. FOV/Principal Point Sanity Check:")
-    H, W = image_size
-    
-    # For fisheye, load intrinsics from calibration file if available
-    if is_fisheye and online_calibration_path:
-        try:
-            radial_coeffs, tangential_coeffs, thinprism_coeffs, focal_length, principal_point, aria_original_size = load_aria_distortion_coeffs(online_calibration_path, frame_idx=0)
-            if focal_length is None:
-                raise ValueError("Failed to load focal_length")
-
-            # focal_length is now a single value array [f]
-            f = focal_length[0]
-            fx, fy = f, f  # Fisheye uses single focal length
-            cx, cy = principal_point[0], principal_point[1]
-            logger.info("   Using intrinsics from online_calibration.jsonl for fisheye check.")
-
-            # Scale intrinsics for consistency check against target image size
-            if aria_original_size:
-                fx, fy, cx, cy = scale_intrinsics(fx, fy, cx, cy, aria_original_size, image_size)
-            else:
-                logger.warning("   aria_original_size not available for consistency check, results may be inaccurate.")
-
-        except Exception as e:
-            logger.warning(f"   Could not load fisheye intrinsics, falling back to ego_intrinsics: {e}")
-            fx, fy, cx, cy = ego_intrinsics[0,0], ego_intrinsics[1,1], ego_intrinsics[0,2], ego_intrinsics[1,2]
-    else:
-        fx, fy, cx, cy = ego_intrinsics[0,0], ego_intrinsics[1,1], ego_intrinsics[0,2], ego_intrinsics[1,2]
-
-    logger.info(f"   Image size: {W} x {H}")
-    logger.info(f"   Intrinsics: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
-    
-    # Check principal point
-    expected_cx, expected_cy = W/2, H/2
-    cx_error = abs(cx - expected_cx)
-    cy_error = abs(cy - expected_cy)
-    
-    logger.info(f"   Principal point: ({cx:.1f}, {cy:.1f}), expected: ({expected_cx:.1f}, {expected_cy:.1f})")
-    logger.info(f"   Principal point error: ({cx_error:.1f}, {cy_error:.1f})")
-    
-    # For fisheye cameras, principal point can be more off-center due to lens characteristics
-    threshold_ratio = 0.5 if is_fisheye else 0.2  # 50% for fisheye, 20% for pinhole
-    if cx_error < W*threshold_ratio and cy_error < H*threshold_ratio:
-        logger.info("   ✅ Principal point looks REASONABLE")
-    else:
-        if is_fisheye:
-            logger.info(f"   ⚠️  Fisheye principal point is off-center (common for fisheye lenses)")
-        else:
-            logger.warning("   ❌ Principal point ERROR - too far from image center")
-    
-    # Check FOV
-    # Note: This is a simplified FOV calculation for a pinhole model.
-    # For fisheye, it's an approximation, but still useful for sanity checking focal lengths.
-    fov_x_rad = 2 * np.arctan(W / (2 * fx))
-    fov_y_rad = 2 * np.arctan(H / (2 * fy))
-    fov_x_deg = np.degrees(fov_x_rad)
-    fov_y_deg = np.degrees(fov_y_rad)
-    
-    logger.info(f"   Horizontal FOV (approx): {fov_x_deg:.1f}°")
-    logger.info(f"   Vertical FOV (approx): {fov_y_deg:.1f}°")
-    
-    if is_fisheye:
-        # Fisheye lenses can have wide variety of FOVs depending on the lens design
-        # Aria cameras may not always exceed 120 degrees in effective FOV after cropping
-        if fov_x_deg > 90 and fov_y_deg > 80:
-            logger.info("   ✅ Fisheye FOV looks REASONABLE for Aria camera")
-        else:
-            logger.warning(f"   ⚠️  Fisheye FOV may be limited by sensor cropping or lens characteristics")
-    else:
-        if 30 <= fov_x_deg <= 120 and 30 <= fov_y_deg <= 120:
-            logger.info("   ✅ Pinhole FOV looks REASONABLE")
-        else:
-            logger.warning(f"   ❌ Pinhole FOV ERROR - unusual FOV values (expected 30-120°)")
-    
-    logger.info("=" * 60)
-
-def load_ego_camera_poses(camera_pose_path: str, input_dir: str = None) -> Tuple[np.ndarray, List[np.ndarray]]:
-    """
-    Load ego camera poses from JSON file.
-    
-    Args:
-        camera_pose_path: Path to JSON file containing camera poses
-        input_dir: ViPE input directory (used for matching when loading from ego_prior_datasets JSON)
-    
-    Returns:
-        intrinsics: 3x3 camera intrinsics matrix
-        extrinsics_list: List of 3x4 camera extrinsics matrices for each frame (world-to-camera)
-    """
-    with open(camera_pose_path, 'r') as f:
-        data = json.load(f)
-    
-    # Special case: ego_prior_datasets_split_with_camera_params.json
-    if camera_pose_path == "/home/nas_main/taewoongkang/dohyeon/Exo-to-Ego/Ego-Renderer-from-ViPE/inthewild_dataset/ego_prior_datasets_split_with_camera_params.json":
-        from pathlib import Path
-        
-        if input_dir is None:
-            raise ValueError("input_dir must be provided when using ego_prior_datasets_split_with_camera_params.json")
-        
-        # Get stem from input_dir (e.g., "ironman_captain_moge_static_vda_fixedcam_slammap" -> "ironman_captain")
-        input_stem_full = Path(input_dir).stem
-        if '_moge' in input_stem_full:
-            input_stem = input_stem_full.split('_moge')[0]
-        else:
-            input_stem = input_stem_full.split('_')[0]
-        logger.info(f"Looking for vipe_path with stem matching: {input_stem}")
-        
-        # Search for matching sample in test_datasets
-        matching_sample = None
-        for sample in data['test_datasets']:
-            vipe_path = sample['vipe_path']
-            vipe_stem_full = Path(vipe_path).stem
-            if '_moge' in vipe_stem_full:
-                vipe_stem = vipe_stem_full.split('_moge')[0]
-            else:
-                vipe_stem = vipe_stem_full.split('_')[0]
-            
-            if vipe_stem == input_stem:
-                matching_sample = sample
-                logger.info(f"Found matching sample: vipe_path={vipe_path}")
-                break
-        
-        if matching_sample is None:
-            raise ValueError(f"No matching sample found for input_dir stem '{input_stem}' in {camera_pose_path}")
-        
-        # Extract ego intrinsics and extrinsics from matching sample
-        intrinsics = np.array(matching_sample['ego_intrinsics'])  # 3x3
-        
-        # ego_extrinsics is a list of 3x4 matrices
-        ego_extrinsics_raw = matching_sample['ego_extrinsics']
-        extrinsics_list = [np.array(ext) for ext in ego_extrinsics_raw]  # Convert each 3x4 matrix
-        
-        logger.info(f"Loaded ego camera poses from ego_prior_datasets JSON")
-        logger.info(f"Loaded intrinsics: {intrinsics.shape}")
-        logger.info(f"Loaded {len(extrinsics_list)} extrinsics matrices (W2C - world-to-camera format)")
-        
-        return intrinsics, extrinsics_list
-    
-    # Standard case: Ego4D camera pose file with aria camera
-    # Find aria camera (ego view)
-    aria_key = None
-    for key in data.keys():
-        if key.startswith('aria'):
-            aria_key = key
-            break
-    
-    if aria_key is None:
-        raise ValueError("No aria camera found in camera pose file")
-    
-    logger.info(f"Using ego camera: {aria_key}")
-    
-    # Extract camera intrinsics (3x3)
-    intrinsics = np.array(data[aria_key]['camera_intrinsics'])
-    
-    # Extract camera extrinsics for each frame
-    # camera_extrinsics is a dictionary with string keys "0", "1", etc.
-    extrinsics_dict = data[aria_key]['camera_extrinsics']
-    extrinsics_list = []
-    
-    # Get all keys and sort them numerically
-    frame_indices = sorted([int(k) for k in extrinsics_dict.keys()])
-    
-    for frame_idx in frame_indices:
-        # Load as 3x4 matrix from JSON
-        extrinsics = np.array(extrinsics_dict[str(frame_idx)])
-        extrinsics_list.append(extrinsics)
-    
-    logger.info(f"Loaded intrinsics: {intrinsics.shape}")
-    logger.info(f"Loaded {len(extrinsics_list)} extrinsics matrices (W2C - world-to-camera format)")
-    
-    return intrinsics, extrinsics_list
-
 def load_aria_distortion_coeffs(
-        online_calibration_path: str,
+        online_calibration_path: Optional[str] = None,
         frame_idx: int = 0
-    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[Tuple[int, int]]]:
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Load Aria camera distortion coefficients from Ego4D online calibration file.
+    If online_calibration_path is None, returns preset fisheye distortion coefficients for FisheyeRadTanThinPrism model
     
     Args:
-        online_calibration_path: Path to online_calibration.jsonl file
+        online_calibration_path: Path to online_calibration.jsonl file (optional)
         frame_idx: Frame index to extract calibration from (default: 0 for first frame)
     
     Returns:
         A tuple containing:
-        - distortion_coeffs: Distortion coefficients for FisheyeRadTanThinPrism model
-        - focal_length: (fx, fy) 
-        - principal_point: (cx, cy)
-        - original_size: (H, W) of the camera sensor
+        - radial_distortion_coeffs: Radial distortion coefficients [k1, k2, k3, k4, k5, k6]
+        - tangential_distortion_coeffs: Tangential distortion coefficients [p1, p2]
+        - thinPrism_distortion_coeffs: Thin prism distortion coefficients [s1, s2, s3, s4]
+        - focal_length: Single focal length [f] (None if using defaults)
+        - principal_point: Principal point [cx, cy] (None if using defaults)
     """
     import json
+    
+    # If no calibration file provided, return default Ego-Exo4D distortion coefficients
+    if online_calibration_path is None:
+        logger.info("No online_calibration_path provided. Using default Ego-Exo4D fisheye distortion coefficients.")
+        
+        # Default Ego-Exo4D Aria camera distortion coefficients
+        radial_distortion_coeffs = np.array([
+            -0.02340373583137989, 0.09388021379709244, -0.06088035926222801,
+            0.0053304750472307205, 0.003342868760228157, -0.0006356257363222539
+        ])
+        tangential_distortion_coeffs = np.array([0.0005087381578050554, -0.0004747129278257489])
+        thinPrism_distortion_coeffs = np.array([
+            -0.0011330085108056664, -0.00025734835071489215,
+            0.00009328465239377692, 0.00009424977179151028
+        ])
+        
+        logger.info(f"Default radial distortion coeffs: k1={radial_distortion_coeffs[0]:.6f}, k2={radial_distortion_coeffs[1]:.6f}, k3={radial_distortion_coeffs[2]:.6f}, k4={radial_distortion_coeffs[3]:.6f}, k5={radial_distortion_coeffs[4]:.6f}, k6={radial_distortion_coeffs[5]:.6f}")
+        logger.info(f"Default tangential distortion coeffs: p1={tangential_distortion_coeffs[0]:.10f}, p2={tangential_distortion_coeffs[1]:.10f}")
+        logger.info(f"Default thin prism distortion coeffs: s1={thinPrism_distortion_coeffs[0]:.10f}, s2={thinPrism_distortion_coeffs[1]:.10f}, s3={thinPrism_distortion_coeffs[2]:.10f}, s4={thinPrism_distortion_coeffs[3]:.10f}")
+        
+        # Return distortion coefficients without original_size (caller should provide it)
+        # focal_length and principal_point are also None (will be taken from ego_intrinsics)
+        return radial_distortion_coeffs, tangential_distortion_coeffs, thinPrism_distortion_coeffs, None, None
     
     logger.info(f"Loading Aria distortion coefficients from {online_calibration_path}")
     
@@ -425,7 +177,7 @@ def load_aria_distortion_coeffs(
     
     if not lines:
         logger.error("online_calibration.jsonl is empty.")
-        return None, None, None, None
+        return None, None, None, None, None
 
     if frame_idx >= len(lines):
         logger.warning(f"Frame {frame_idx} not found, using frame 0")
@@ -443,24 +195,18 @@ def load_aria_distortion_coeffs(
     
     if aria_calib is None:
         logger.error("camera-rgb (Aria) calibration not found in online_calibration.jsonl")
-        return None, None, None, None
+        return None, None, None, None, None
     
     # Extract projection parameters
     projection = aria_calib.get('Projection')
     if not projection or projection.get('Name') != 'FisheyeRadTanThinPrism':
         logger.warning(f"Expected FisheyeRadTanThinPrism, but not found or type is different.")
-        return None, None, None, None
+        return None, None, None, None, None
     
     params = projection.get('Params', [])
     if len(params) < 10:
         logger.error("Insufficient parameters for FisheyeRadTanThinPrism model.")
-        return None, None, None, None
-
-    # Aria RGB camera standard resolution (when resolution info is not available in calibration)
-    # The intrinsic parameters are calibrated for this native sensor resolution
-    aria_standard_width = 2880
-    aria_standard_height = 2880
-    original_size = (aria_standard_height, aria_standard_width)
+        return None, None, None, None, None
 
     # FisheyeRadTanThinPrism parameter layout:
     # [f, cx, cy, k1, k2, k3, k4, k5, k6, p1, p2, s1, s2, s3, s4] maybe...
@@ -479,139 +225,102 @@ def load_aria_distortion_coeffs(
     principal_point = np.array([cx, cy])
     
     logger.info(f"Loaded Aria distortion coefficients:")
-    logger.info(f"  Using Aria standard resolution: {aria_standard_width} x {aria_standard_height}")
     logger.info(f"  Focal length: f={f:.1f}")
     logger.info(f"  Principal point: cx={cx:.1f}, cy={cy:.1f}")
     logger.info(f"  Radial distortion coeffs: k1={k1:.6f}, k2={k2:.6f}, k3={k3:.6f}, k4={k4:.6f}, k5={k5:.6f}, k6={k6:.6f}")
     logger.info(f"  Tangential distortion coeffs: p1={p1:.6f}, p2={p2:.6f}")
     logger.info(f"  ThinPrism distortion coeffs: s1={s1:.6f}, s2={s2:.6f}, s3={s3:.6f}, s4={s4:.6f}")
     
-    return radial_distortion_coeffs, tangential_distortion_coeffs, thinPrism_distortion_coeffs, focal_length, principal_point, original_size
+    return radial_distortion_coeffs, tangential_distortion_coeffs, thinPrism_distortion_coeffs, focal_length, principal_point
 
-def parse_camera_id_from_input_dir(input_dir: str) -> Optional[str]:
+
+def load_camera_params_from_meta(meta_json_path: str, input_dir: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[np.ndarray]]:
     """
-    Parse camera ID from input directory path.
+    Load camera parameters from meta.json based on input directory.
     
     Args:
-        input_dir: Input directory path like 'vipe_results/take_name/cam04_static_vda_fixedcam_slammap' or 'vipe_results/take_name/gp02_static_vda_fixedcam_slammap'
+        meta_json_path: Path to meta.json file
+        input_dir: Input directory path (e.g., 'vipe_results/joker')
     
     Returns:
-        Camera ID string like 'cam04' or 'gp02', or None if no camera ID pattern found (e.g., for in-the-wild videos)
+        exo_intrinsic: 3x3 exo camera intrinsics matrix
+        exo_extrinsic: 4x4 exo camera extrinsics matrix (world to cam)
+        ego_intrinsic: 3x3 ego camera intrinsics matrix  
+        ego_extrinsics: List of 4x4 ego camera extrinsics matrices for each frame (world to cam)
     """
-    import re
+    import json
+    from pathlib import Path
     
-    # Extract camera ID pattern (cam + 2 digits or gp + 2 digits)
-    pattern = r'(cam\d{2}|gp\d{2})'
-    match = re.search(pattern, input_dir)
+    # Get video name from input_dir stem (e.g., 'joker' from 'vipe_results/joker')
+    video_name = Path(input_dir).stem
+    logger.info(f"Looking for video_name='{video_name}' in meta.json")
     
-    if match:
-        cam_id = match.group(0)
-        logger.info(f"Parsed camera ID '{cam_id}' from input_dir: {input_dir}")
-        return cam_id
-    else:
-        # Return None for in-the-wild videos (no camera ID)
-        logger.info(f"No camera ID pattern found in input_dir: {input_dir} (likely in-the-wild video)")
-        return None
+    # Load meta.json
+    with open(meta_json_path, 'r') as f:
+        meta_data = json.load(f)
+    
+    # Find matching sample
+    matching_sample = None
+    for sample in meta_data.get('test_datasets', []):
+        exo_path = sample.get('exo_path', '')
+        # Check if parent directory name matches video_name
+        # e.g., './example/in_the_wild/videos/joker/exo.mp4' -> parent = 'joker'
+        exo_parent = Path(exo_path).parent.name
+        if exo_parent == video_name:
+            matching_sample = sample
+            logger.info(f"Found matching sample: exo_path='{exo_path}'")
+            break
+    
+    if matching_sample is None:
+        raise ValueError(f"No matching sample found for video_name='{video_name}' in {meta_json_path}")
+    
+    # Extract camera parameters
+    exo_intrinsic = np.array(matching_sample['camera_intrinsics'], dtype=np.float32)
+    exo_extrinsic_3x4 = np.array(matching_sample['camera_extrinsics'], dtype=np.float32)
+    
+    ego_intrinsic = np.array(matching_sample['ego_intrinsics'], dtype=np.float32)
+    ego_extrinsics_3x4 = matching_sample['ego_extrinsics']
+    
+    # Convert exo extrinsics from 3x4 to 4x4 by adding [0, 0, 0, 1] row
+    exo_extrinsic = np.eye(4, dtype=np.float32)
+    exo_extrinsic[:3, :] = exo_extrinsic_3x4
+    
+    # Convert ego extrinsics from 3x4 to 4x4 by adding [0, 0, 0, 1] row
+    ego_extrinsics = []
+    for ext_3x4 in ego_extrinsics_3x4:
+        ext_3x4_array = np.array(ext_3x4, dtype=np.float32)
+        ext_4x4 = np.eye(4, dtype=np.float32)
+        ext_4x4[:3, :] = ext_3x4_array
+        ego_extrinsics.append(ext_4x4)
+    
+    logger.info(f"Loaded exo_intrinsic: {exo_intrinsic.shape}")
+    logger.info(f"Loaded exo_extrinsic: {exo_extrinsic.shape} (world to cam, 4x4)")
+    logger.info(f"Loaded ego_intrinsic: {ego_intrinsic.shape}")
+    logger.info(f"Loaded {len(ego_extrinsics)} ego_extrinsics (world to cam, 4x4)")
+    
+    return exo_intrinsic, exo_extrinsic, ego_intrinsic, ego_extrinsics
 
-def load_exo_camera_pose(exo_camera_pose_path: str, cam_id: Optional[str]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Load exo camera pose from Ego4D trajectory CSV file.
-    
-    Args:
-        exo_camera_pose_path: Path to gopro_calibs.csv file (or "inthewild" for identity matrix)
-        cam_id: Camera ID to extract (e.g., 'cam01', 'cam02', 'gp01', 'gp02', etc.), or None for in-the-wild videos
-    
-    Returns:
-        T_world_to_cam: 4x4 transformation matrix from world to camera coordinates
-        T_cam_to_world: 4x4 transformation matrix from camera to world coordinates
-        camera_center: 3D camera center position in world coordinates
-    """
-    import pandas as pd
-    from scipy.spatial.transform import Rotation as R
-    
-    # Special case: in-the-wild videos (no exo camera pose available)
-    if exo_camera_pose_path == "inthewild":
-        logger.info("Using identity extrinsic for in-the-wild video (no exo camera pose)")
-        # Identity transformation: world == camera coordinate system
-        T_world_to_cam = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]
-        ], dtype=np.float32)
-        T_cam_to_world = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]
-        ], dtype=np.float32)
-        camera_center = np.array([0, 0, 0], dtype=np.float32)  # Origin
-        return T_world_to_cam, T_cam_to_world, camera_center
-    
-    # Validate cam_id is provided for non-inthewild cases
-    if cam_id is None:
-        raise ValueError("cam_id is required when exo_camera_pose_path is not 'inthewild'")
-    
-    # Read CSV file
-    df = pd.read_csv(exo_camera_pose_path)
-    
-    # Find the camera row
-    cam_row = df[df['cam_uid'] == cam_id]
-    if cam_row.empty:
-        raise ValueError(f"Camera {cam_id} not found in {exo_camera_pose_path}")
-    
-    cam_row = cam_row.iloc[0]
-    
-    # Extract translation and quaternion
-    # Ego-Exo4D CSV format: tx_world_cam, qx_world_cam etc. represent T_cam_to_world (T_wc)
-    tx = cam_row['tx_world_cam']
-    ty = cam_row['ty_world_cam'] 
-    tz = cam_row['tz_world_cam']
-    camera_center = np.array([tx, ty, tz])  # Camera center in world coordinates
-    
-    # Extract quaternion (qx, qy, qz, qw) - rotation from camera to world (R_wc)
-    qx = cam_row['qx_world_cam']
-    qy = cam_row['qy_world_cam']
-    qz = cam_row['qz_world_cam']
-    qw = cam_row['qw_world_cam']
-    quaternion = np.array([qx, qy, qz, qw])
-    
-    # Convert quaternion to rotation matrix (camera to world)
-    R_cam_to_world = R.from_quat(quaternion).as_matrix()
-    
-    # Create camera-to-world transformation (T_wc)
-    T_cam_to_world = np.eye(4)
-    T_cam_to_world[:3, :3] = R_cam_to_world  # Camera to world rotation
-    T_cam_to_world[:3, 3] = camera_center    # Camera center position in world
-    
-    # Create world-to-camera transformation (T_cw = inv(T_wc))
-    T_world_to_cam = np.eye(4)
-    T_world_to_cam[:3, :3] = R_cam_to_world.T  # Inverse rotation (world to camera)
-    T_world_to_cam[:3, 3] = -R_cam_to_world.T @ camera_center  # Proper translation
-    
-    logger.info(f"Loaded exo camera {cam_id} pose from {exo_camera_pose_path}")
-    logger.info(f"Camera center in world: {camera_center}")
-    logger.info(f"Quaternion (cam->world): {quaternion}")
-    
-    return T_world_to_cam, T_cam_to_world, camera_center
 
 def build_background_pointcloud(
         input_dir: str,
-        exo_camera_pose_path: str,
+        T_cam_to_world: np.ndarray,
         spatial_subsample: int = 2
-    ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int], np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int], np.ndarray]:
     """
-    Build background-only global point cloud from all frames in Ego4D world coordinates.
+    Build background-only global point cloud from all frames in world coordinates.
 
     This function prioritizes SLAM map if available, otherwise falls back to depth-based reconstruction.
     It always keeps only background points (instance id == 0 when using depth method).
 
+    Args:
+        input_dir: Path to ViPE inference results
+        T_cam_to_world: 4x4 transformation matrix from camera to world coordinates
+        spatial_subsample: Spatial subsampling factor for point cloud
+    
     Returns:
-        global_points: Nx3 array of 3D points in Ego4D world coordinates
+        global_points: Nx3 array of 3D points in world coordinates
         global_colors: Nx3 array of RGB colors (0-255)
         image_size: (height, width) of original frames
-        T_cam_to_world: 4x4 transformation used to convert ViPE -> Ego4D
-        csv_camera_center: 3-vector camera center read from CSV
     """
     # Use ViPE's ArtifactPath to find inference artifacts
     artifacts = list(ArtifactPath.glob_artifacts(Path(input_dir), use_video=True))
@@ -619,49 +328,6 @@ def build_background_pointcloud(
         raise ValueError(f"No ViPE artifacts found in {input_dir}")
     artifact_path = artifacts[0]
 
-    # Parse camera ID from input directory
-    cam_id = parse_camera_id_from_input_dir(input_dir)
-    
-    # Load exo camera transformation for coordinate system conversion
-    _, T_cam_to_world, csv_camera_center = load_exo_camera_pose(exo_camera_pose_path, cam_id=cam_id)
-    
-    # ! deprecated
-    # Check if SLAM map is available
-    # if artifact_path.slam_map_path.exists():
-    #     logger.info("SLAM map found, using SLAM map for background point cloud...")
-    #     slam_map = SLAMMap.load(artifact_path.slam_map_path, device=torch.device("cpu"))
-        
-    #     global_points = []
-    #     global_colors = []
-        
-    #     # Extract points from all keyframes in SLAM map
-    #     for keyframe_idx, frame_idx in enumerate(slam_map.dense_disp_frame_inds):
-    #         xyz, rgb = slam_map.get_dense_disp_pcd(keyframe_idx)
-    #         xyz_np = xyz.cpu().numpy()
-    #         rgb_np = rgb.cpu().numpy()
-            
-    #         global_points.append(xyz_np)
-    #         global_colors.append((rgb_np * 255).astype(np.uint8))
-        
-    #     if global_points:
-    #         global_points = np.concatenate(global_points, axis=0)
-    #         global_colors = np.concatenate(global_colors, axis=0)
-    #         logger.info(f"Built background point cloud from SLAM map with {len(global_points)} total points")
-            
-    #         # Transform from ViPE to Ego4D coordinates
-    #         points_homogeneous = np.hstack([global_points, np.ones((len(global_points), 1))])
-    #         global_points_transformed = (T_cam_to_world @ points_homogeneous.T).T[:, :3]
-            
-    #         # Get image size from first RGB frame
-    #         for _, rgb in read_rgb_artifacts(artifact_path.rgb_path):
-    #             image_size = rgb.shape[:2]  # (height, width)
-    #             break
-            
-    #         return global_points_transformed, global_colors, image_size, T_cam_to_world, csv_camera_center
-    #     else:
-    #         logger.warning("No points found in SLAM map, falling back to depth-based reconstruction")
-    # else:
-    #     logger.info("No SLAM map found, using depth-based reconstruction for background point cloud...")
 
     # Fallback to original depth-based method
     global_points = []
@@ -769,31 +435,25 @@ def build_background_pointcloud(
         global_colors = np.concatenate(global_colors, axis=0)
         logger.info(f"Built background point cloud with {len(global_points)} total points from {frame_count} frames")
 
-        # Transform points from ViPE coordinate system to Ego4D coordinate system
-        logger.info("Transforming background point cloud from ViPE to Ego4D coordinate system...")
-
-        # Parse camera ID from input directory and load exo camera pose from CSV file
-        cam_id = parse_camera_id_from_input_dir(input_dir)
-        _, T_cam_to_world, csv_camera_center = load_exo_camera_pose(exo_camera_pose_path, cam_id=cam_id)
-
-        logger.info(f"Exo camera ({cam_id}) transformation matrix ({cam_id} -> Ego4D world):\n{T_cam_to_world}")
+        # Transform points from ViPE coordinate system to world coordinate system
+        logger.info("Transforming background point cloud from ViPE to world coordinate system...")
+        logger.info(f"Using T_cam_to_world transformation matrix:\n{T_cam_to_world}")
 
         points_homogeneous = np.hstack([global_points, np.ones((len(global_points), 1))])
         global_points_transformed = (T_cam_to_world @ points_homogeneous.T).T[:, :3]
 
         global_points = global_points_transformed
-        logger.info("Successfully transformed background point cloud to Ego4D coordinate system")
+        logger.info("Successfully transformed background point cloud to world coordinate system")
 
         # Store transformation info for consistency checks
-        return global_points, global_colors, image_size, T_cam_to_world, csv_camera_center
+        return global_points, global_colors, image_size, T_cam_to_world
 
     else:
         global_points = np.empty((0, 3))
         global_colors = np.empty((0, 3))
         logger.warning("No valid background points found in any frame")
         T_cam_to_world = np.eye(4)
-        csv_camera_center = np.zeros(3)
-        return global_points, global_colors, image_size, T_cam_to_world, csv_camera_center
+        return global_points, global_colors, image_size
     
 
 def compute_robust_mean_tensors(stacked_depth: torch.Tensor, stacked_rgb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -816,35 +476,28 @@ def compute_robust_mean_tensors(stacked_depth: torch.Tensor, stacked_rgb: torch.
 
 def build_mean_background_pointcloud(
         input_dir: str,
-        exo_camera_pose_path: str,
+        T_cam_to_world: np.ndarray,
         spatial_subsample: int = 2,
         max_frames: int = None
-    ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int], np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int], np.ndarray]:
     """
     Build a static background point cloud using nanmean.
     
     Args:
         input_dir: Directory containing ViPE artifacts
-        exo_camera_pose_path: Path to camera pose CSV file
+        T_cam_to_world: 4x4 transformation matrix from camera to world coordinates
         spatial_subsample: Spatial subsampling factor for point cloud
         max_frames: Maximum number of frames to process (None for all)
 
     Returns:
-        mean_bg_points: Nx3 array of 3D points in Ego4D world coordinates (nanmean background)  
+        mean_bg_points: Nx3 array of 3D points in world coordinates (nanmean background)  
         mean_bg_colors: Nx3 array of RGB colors (0-255) (nanmean background)
         image_size: (height, width) of original frames
-        T_cam_to_world: 4x4 transformation used to convert ViPE -> Ego4D
-        csv_camera_center: 3-vector camera center read from CSV
     """
     artifacts = list(ArtifactPath.glob_artifacts(Path(input_dir), use_video=True))
     if not artifacts:
         raise ValueError(f"No ViPE artifacts found in {input_dir}")
     artifact_path = artifacts[0]
-
-    # Parse camera ID from input directory
-    cam_id = parse_camera_id_from_input_dir(input_dir)
-    
-    _, T_cam_to_world, csv_camera_center = load_exo_camera_pose(exo_camera_pose_path, cam_id=cam_id)
 
     # 최적화: 모든 유효한 프레임을 스택으로 수집
     valid_depth_frames = []
@@ -918,7 +571,7 @@ def build_mean_background_pointcloud(
 
     if not valid_depth_frames:
         logger.warning("No valid background frames found.")
-        return np.empty((0, 3)), np.empty((0, 3)), image_size, T_cam_to_world, csv_camera_center
+        return np.empty((0, 3)), np.empty((0, 3)), image_size
 
     # nanmean으로 대표값 계산
     logger.info(f"Computing nanmean across {len(valid_depth_frames)} frames...")
@@ -1000,8 +653,7 @@ def build_mean_background_pointcloud(
     points_homogeneous = np.hstack([valid_points, np.ones((len(valid_points), 1))])
     mean_bg_points_transformed = (T_cam_to_world @ points_homogeneous.T).T[:, :3]
 
-    return mean_bg_points_transformed, valid_colors, image_size, T_cam_to_world, csv_camera_center
-
+    return mean_bg_points_transformed, valid_colors, image_size
 
 def build_dynamic_points_for_frame(artifact_path: ArtifactPath, frame_idx: int,
                                    T_cam_to_world: np.ndarray,
@@ -1017,34 +669,6 @@ def build_dynamic_points_for_frame(artifact_path: ArtifactPath, frame_idx: int,
         dynamic_points_transformed: Mx3 array in Ego4D world coordinates
         dynamic_colors_transformed: Mx3 RGB colors
     """
-    # ! deprecated
-    # Check if SLAM map is available and contains this frame
-    # if artifact_path.slam_map_path.exists():
-    #     slam_map = SLAMMap.load(artifact_path.slam_map_path, device=torch.device("cpu"))
-        
-    #     # Check if this frame is a keyframe in the SLAM map
-    #     if frame_idx in slam_map.dense_disp_frame_inds:
-    #         keyframe_idx = slam_map.dense_disp_frame_inds.index(frame_idx)
-    #         logger.info(f"Frame {frame_idx}: Using SLAM map (keyframe {keyframe_idx}) for dynamic points...")
-            
-    #         # Get points from SLAM map for this keyframe
-    #         xyz, rgb = slam_map.get_dense_disp_pcd(keyframe_idx)
-    #         xyz_np = xyz.cpu().numpy()
-    #         rgb_np = (rgb.cpu().numpy() * 255).astype(np.uint8)
-            
-    #         # Note: SLAM map doesn't have instance segmentation, so we return all points
-    #         # The caller can decide how to handle this case
-    #         logger.info(f"Frame {frame_idx}: Got {len(xyz_np)} points from SLAM map (no dynamic filtering available)")
-            
-    #         # Transform from ViPE to Ego4D coordinates
-    #         points_homogeneous = np.hstack([xyz_np, np.ones((len(xyz_np), 1))])
-    #         points_transformed = (T_cam_to_world @ points_homogeneous.T).T[:, :3]
-            
-    #         return points_transformed, rgb_np
-    #     else:
-    #         logger.info(f"Frame {frame_idx}: Not a keyframe in SLAM map, falling back to depth-based reconstruction...")
-    # else:
-    #     logger.info(f"Frame {frame_idx}: No SLAM map found, using depth-based reconstruction for dynamic points...")
 
     # Fallback to original depth-based method for dynamic points
     # Iterate through artifacts until we hit the desired frame
@@ -1285,8 +909,7 @@ def render_points_fisheye(points_world, colors_world, T_w2c, ego_intrinsics, W=6
         W, H: Image dimensions
         point_size: Size of rendered points
         device: Device for rendering
-        distortion_coeffs: Fish-eye distortion coefficients [k1, k2, k3, k4, k5, k6]. 
-                          If None, uses default values [-0.2, 0.1, 0.0, 0.0, 0.0, 0.0]
+        distortion_coeffs: Fish-eye distortion coefficients
         focal_length: (f) focal lengths. If None, extracts from ego_intrinsics
         principal_point: (cx, cy) principal point. If None, extracts from ego_intrinsics
         original_image_size: (H, W) of the original camera sensor, for scaling intrinsics
@@ -1384,23 +1007,14 @@ def render_points_fisheye(points_world, colors_world, T_w2c, ego_intrinsics, W=6
     T_t = torch.from_numpy(t_pt3d).to(device=device, dtype=torch.float32).unsqueeze(0)  # (1,3)
     
     # FishEyeCameras requires radial distortion parameters
-    # Use provided distortion coefficients or default values for fish-eye effect
-    if radial_distortion_coeffs is not None:
-        if len(radial_distortion_coeffs) == 6:
-            k1, k2, k3, k4, k5, k6 = radial_distortion_coeffs
-            logger.info(f"Using provided distortion coefficients: k1={k1:.6f}, k2={k2:.6f}, k3={k3:.6f}, k4={k4:.6f}, k5={k5:.6f}, k6={k6:.6f}")
-        elif len(radial_distortion_coeffs) == 4:
-            k1, k2, k3, k4 = radial_distortion_coeffs
-            k5, k6 = 0.0, 0.0  # Pad with zeros
-            logger.info(f"Using provided distortion coefficients: k1={k1:.6f}, k2={k2:.6f}, k3={k3:.6f}, k4={k4:.6f} (k5=0, k6=0)")
-        else:
-            raise ValueError("distortion_coeffs must have exactly 4 or 6 values [k1, k2, k3, k4(, k5, k6)]")
-    else:
-        # Default fish-eye distortion coefficients that create reasonable fish-eye effect
-        k1, k2, k3, k4, k5, k6 = -0.2, 0.1, 0.0, 0.0, 0.0, 0.0
-        logger.info(f"Using default distortion coefficients: k1={k1}, k2={k2}, k3={k3}, k4={k4}, k5={k5}, k6={k6}")
+    if radial_distortion_coeffs is None or len(radial_distortion_coeffs) == 0:
+        raise ValueError("radial_distortion_coeffs must be provided")
+    if tangential_distortion_coeffs is None or len(tangential_distortion_coeffs) == 0:
+        raise ValueError("tangential_distortion_coeffs must be provided")
+    if thinPrism_distortion_coeffs is None or len(thinPrism_distortion_coeffs) == 0:
+        raise ValueError("thinPrism_distortion_coeffs must be provided")
     
-    radial_distortion = torch.tensor([[k1, k2, k3, k4, k5, k6]], device=device, dtype=torch.float32)
+    radial_distortion = torch.tensor([radial_distortion_coeffs], device=device, dtype=torch.float32)
     tangential_distortion = torch.tensor([tangential_distortion_coeffs], device=device, dtype=torch.float32)
     thinPrism_distortion = torch.tensor([thinPrism_distortion_coeffs], device=device, dtype=torch.float32)
 
@@ -1422,9 +1036,9 @@ def render_points_fisheye(points_world, colors_world, T_w2c, ego_intrinsics, W=6
         logger.info(f"Using intrinsics from ego_intrinsics: f={f:.1f}, cx={cx:.1f}, cy={cy:.1f}")
     
     def _pix_to_ndc(f, cx, cy, W, H):
-        f_ndc = 2.0 * f / W # W = H라고 가정
+        f_ndc = 2.0 * f / W # W = H
         cx_ndc = 2.0 * (cx / W) - 1.0
-        cy_ndc = 1.0 - 2.0 * (cy / H)  # y축 방향 반전 주의
+        cy_ndc = 1.0 - 2.0 * (cy / H)
         return f_ndc, cx_ndc, cy_ndc
 
     f_ndc, cx_ndc, cy_ndc = _pix_to_ndc(f, cx, cy, W, H) # FishEyeCameras.in_ndc == True
@@ -1508,7 +1122,7 @@ def project_points_to_image_sequential(bg_points_3d: np.ndarray, bg_colors: np.n
         point_size: Size of rendered points
         use_fisheye: Whether to use fish-eye rendering (180-degree FOV)
         online_calibration_path: Path to online_calibration.jsonl for real distortion coeffs
-        original_image_size: (H, W) of the original camera sensor, for scaling intrinsics
+        original_image_size: (H, W) of the original ego camera(Project Aria in Ego-Exo4D), for scaling intrinsics
     
     Returns:
         List of rendered images as HxWx3 arrays
@@ -1521,38 +1135,47 @@ def project_points_to_image_sequential(bg_points_3d: np.ndarray, bg_colors: np.n
     
     rendered_images = []
     
-    # Load Aria distortion coefficients if using fish-eye and calibration file is provided
+    # Load Aria distortion coefficients if using fish-eye
+    # load_aria_distortion_coeffs will return defaults if online_calibration_path is None
     aria_radial_distortion = None
     aria_tan_distortion = None
     aria_thin_distortion = None
     aria_focal_length = None
     aria_principal_point = None
-    aria_original_size = original_image_size
+    if original_image_size is not None:
+        aria_original_size = original_image_size
+    else:
+        # Fallback to Aria standard resolution
+        aria_original_size = (2880, 2880)
+        logger.info("Using Aria standard resolution (2880x2880) as fallback for original_image_size")
     
-    if use_fisheye and online_calibration_path:
+    if use_fisheye:
         try:
             (   aria_radial_distortion,
                 aria_tan_distortion,
                 aria_thin_distortion,
                 aria_focal_length,
-                aria_principal_point,
-                aria_original_size
+                aria_principal_point
             ) = load_aria_distortion_coeffs(
                 online_calibration_path,
                 frame_idx=0
             )
+            
             if (aria_radial_distortion is not None and 
                 aria_tan_distortion is not None and 
                 aria_thin_distortion is not None):
-                logger.info("Successfully loaded Aria camera distortion coefficients and original resolution")
+                if online_calibration_path:
+                    logger.info("Successfully loaded Aria camera distortion coefficients from online_calibration.jsonl")
+                else:
+                    logger.info("Using default Ego-Exo4D distortion coefficients")
             else:
-                raise ValueError("Failed to load Aria calibration.")
+                raise ValueError("Failed to load distortion coefficients.")
         except Exception as e:
-            logger.warning(f"Failed to load Aria distortion coefficients: {e}")
-            logger.warning("Will use default fish-eye distortion coefficients")
+            logger.error(f"Failed to load distortion coefficients: {e}")
+            raise
     
     # Process each frame individually, building dynamic points per-frame and concatenating with background
-    for frame_idx, extrinsics in enumerate(tqdm(ego_extrinsics_list, desc="Rendering frames")):
+    for frame_idx, ego_extrinsic in enumerate(tqdm(ego_extrinsics_list, desc="Rendering frames")):
         # Build dynamic points for this frame if artifact_path is provided
         # If only_bg is True, skip building dynamic points to speed up rendering
         if (not only_bg) and artifact_path is not None and T_cam_to_world is not None:
@@ -1568,9 +1191,8 @@ def project_points_to_image_sequential(bg_points_3d: np.ndarray, bg_colors: np.n
             points_to_render = np.vstack([bg_points_3d, dyn_points])
             colors_to_render = np.vstack([bg_colors, dyn_colors])
 
-        # ego_extrinsics is already W2C format, use directly as 4x4 transformation matrix
-        T_w2c = np.eye(4)
-        T_w2c[:3, :] = extrinsics
+        # ego_extrinsics is already W2C format in 4x4, use directly as transformation matrix
+        T_w2c = ego_extrinsic
 
         # Choose rendering function based on fish-eye option
         if use_fisheye:
@@ -1618,18 +1240,15 @@ def get_parser():
     parser = argparse.ArgumentParser(description="Render ViPE point cloud from ego view")
     parser.add_argument("--input_dir", required=True, help="Directory containing ViPE artifacts")
     parser.add_argument("--out_dir", required=True, help="Output directory for rendered images")
-    parser.add_argument("--ego_camera_pose_path", required=True, help="Path to ego camera pose JSON file for rendering")
-    parser.add_argument("--exo_camera_pose_path", required=True, help="Path to exo camera pose CSV file for coordinate transformation")
+    parser.add_argument("--meta_json_path", required=True, help="Path to meta.json file containing camera parameters")
     parser.add_argument("--point_size", type=float, default=1.0, help="Size of rendered points")
     parser.add_argument("--start_frame", type=int, default=0, help="Starting frame number for rendering (default: 0)")
     parser.add_argument("--end_frame", type=int, required=True, help="Ending frame number for rendering (inclusive)")
-    parser.add_argument("--source_start_frame", type=int, help="Source start frame for extrinsics slicing")
-    parser.add_argument("--source_end_frame", type=int, help="Source end frame for extrinsics slicing")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for rendering (default: 8)")
     parser.add_argument("--only_bg", action="store_true", help="Only render background points")
     parser.add_argument("--use_mean_bg", action="store_true", help="Use nanmean background instead of standard background")
     parser.add_argument("--fish_eye_rendering", action="store_true", help="Enable fish-eye rendering with 360-degree view")
-    parser.add_argument("--online_calibration_path", type=str, help="Path to online_calibration.jsonl file for real Aria distortion coefficients (for fish-eye rendering)")
+    parser.add_argument("--online_calibration_path", type=str, default=None, help="(Optional) Path to online_calibration.jsonl file for real Aria distortion coefficients. If not provided, uses default Ego-Exo4D fisheye distortion coefficients.")
 
     return parser
 
@@ -1643,62 +1262,23 @@ def configure_output_directory(args) -> str:
     Returns:
         str: Final configured output directory path
     """
-    # Derive output directory from input_dir with parent and last segment
+    # Extract video name from input_dir (e.g., 'vipe_results/joker' -> 'joker')
     try:
-        input_path_parts = args.input_dir.rstrip("/\\").split(os.sep)
+        input_path = Path(args.input_dir)
+        video_name = input_path.stem  # Get the last component without extension
         
-        # Get parent directory name (e.g., 'cmu_bike01_2') and last segment
-        if len(input_path_parts) >= 2:
-            parent_dir = input_path_parts[-2]  # e.g., 'cmu_bike01_2'
-            input_last = input_path_parts[-1]  # e.g., 'cam01_static_vda_fixedcam' or 'gp02_static_vda_fixedcam'
-        else:
-            parent_dir = "unknown"
-            input_last = input_path_parts[-1] if input_path_parts else "unknown"
-        
-        cam_id, sep, rest = input_last.partition("_")
-        # rest may contain multiple underscores (e.g. 'static_vda_fixedcam')
-        if rest:
-            out_subdir = f"test_output_{rest}"
-        else:
-            out_subdir = "test_output"
-        
-        # Final output: <provided_out_dir>/<parent_dir>/<cam_id>/<out_subdir>
-        output_dir = os.path.join(args.out_dir, parent_dir, cam_id, out_subdir)
-        logger.info(f"Derived output directory from input_dir: {output_dir}")
+        # Final output: <provided_out_dir>/<video_name>
+        output_dir = os.path.join(args.out_dir, video_name)
+        logger.info(f"Derived output directory: {output_dir}")
     except Exception as e:
         logger.warning(f"Failed to derive output dir from input_dir={getattr(args, 'input_dir', None)}: {e}")
         output_dir = args.out_dir
-
-    # Check if mean background is enabled and modify output directory name
-    use_mean_bg_enabled = getattr(args, 'use_mean_bg', False)
-    if use_mean_bg_enabled:
-        # Add _mean_bg suffix to output directory
-        base_out_dir = output_dir.rstrip('/')  # Remove trailing slash if any
-        output_dir = f"{base_out_dir}_mean_bg"
-        logger.info(f"Robust mean background enabled. Output directory changed to: {output_dir}")
-
-    # Check if fish-eye rendering is enabled and modify output directory name
-    fish_eye_enabled = getattr(args, 'fish_eye_rendering', False)
-    if fish_eye_enabled:
-        # Add _fisheye suffix to output directory
-        base_out_dir = output_dir.rstrip('/')  # Remove trailing slash if any
-        output_dir = f"{base_out_dir}_fisheye"
-        logger.info(f"Fish-eye rendering enabled. Output directory changed to: {output_dir}")
-
-    # Append point size suffix to output directory
-    try:
-        pts = float(getattr(args, 'point_size', 1.0))
-        # Keep representation as given (e.g., 0.5)
-        output_dir = f"{output_dir}_pts{pts}"
-        logger.info(f"Appended point size suffix to output dir: {output_dir}")
-    except Exception:
-        logger.warning(f"Could not append point size suffix; using point_size={getattr(args, 'point_size', None)}")
 
     return output_dir
 
 def get_inference_frame_range(input_dir: str) -> tuple[int, int]:
     """
-    Get the frame range from inference results.
+    Get the frame range from ViPE inference results.
     Returns (start_frame, end_frame_inclusive) based on available pose data.
     """
     try:
@@ -1729,20 +1309,17 @@ def get_inference_frame_range(input_dir: str) -> tuple[int, int]:
         logger.error(f"Failed to determine inference frame range: {e}")
         raise
 
-def validate_frame_range(args, total_frames_available: int, input_dir: str) -> tuple[int, int]:
+def validate_frame_range(args, total_frames_available: int, input_dir: str):
     """
-    Validate frame range arguments and return effective rendering range.
+    Validate that frame range arguments exactly match the inference results range.
     
     Args:
         args: Parsed command line arguments with start_frame and end_frame
         total_frames_available: Total number of frames available from ego extrinsics
         input_dir: Input directory containing inference results
         
-    Returns:
-        tuple[int, int]: (effective_end_frame, num_frames_to_render)
-        
     Raises:
-        ValueError: If frame range is invalid
+        ValueError: If frame range doesn't exactly match inference results or is invalid
     """
     # Get inference frame range for validation
     inference_start, inference_end = get_inference_frame_range(input_dir)
@@ -1754,28 +1331,21 @@ def validate_frame_range(args, total_frames_available: int, input_dir: str) -> t
     if args.end_frame <= args.start_frame:
         raise ValueError(f"end_frame ({args.end_frame}) must be greater than start_frame ({args.start_frame})")
     
-    # Validate that requested range is within inference results
-    if args.start_frame < inference_start:
-        raise ValueError(f"start_frame ({args.start_frame}) is below inference range start ({inference_start})")
+    # Check exact match with inference range
+    if args.start_frame != inference_start:
+        raise ValueError(f"start_frame ({args.start_frame}) must match inference range start ({inference_start})")
     
-    if args.end_frame > inference_end:
-        raise ValueError(f"end_frame ({args.end_frame}) exceeds inference range end ({inference_end})")
+    if args.end_frame != inference_end:
+        raise ValueError(f"end_frame ({args.end_frame}) must match inference range end ({inference_end})")
     
     if args.start_frame >= total_frames_available:
         raise ValueError(f"start_frame ({args.start_frame}) exceeds available frames ({total_frames_available})")
     
-    logger.info(f"Frame range validation passed. Requested: [{args.start_frame}, {args.end_frame}], Inference available: [{inference_start}, {inference_end}]")
+    if args.end_frame >= total_frames_available:
+        raise ValueError(f"end_frame ({args.end_frame}) exceeds available frames ({total_frames_available})")
     
-    # Adjust end_frame if it exceeds available frames
-    effective_end_frame = min(args.end_frame, total_frames_available - 1)  # -1 because we're using inclusive indexing
-    num_frames_to_render = effective_end_frame - args.start_frame + 1  # +1 for inclusive end
-    
-    if effective_end_frame != args.end_frame:
-        logger.warning(f"Requested end_frame ({args.end_frame}) exceeds available frames ({total_frames_available-1}), adjusting to {effective_end_frame}")
-    
-    logger.info(f"Rendering frames {args.start_frame} to {effective_end_frame} ({num_frames_to_render} frames out of {total_frames_available} available)")
-    
-    return effective_end_frame, num_frames_to_render
+    num_frames_to_render = args.end_frame - args.start_frame + 1
+    logger.info(f"Frame range validation passed. Rendering frames [{args.start_frame}, {args.end_frame}] ({num_frames_to_render} frames)")
 
 def main():
     parser = get_parser()
@@ -1788,23 +1358,25 @@ def main():
     # Create output directory
     os.makedirs(args.out_dir, exist_ok=True)
     
-    # Parse camera ID from input directory
-    cam_id = parse_camera_id_from_input_dir(args.input_dir)
-    logger.info(f"Using camera ID: {cam_id}")
+    # Load camera parameters from meta.json
+    logger.info(f"Loading camera parameters from {args.meta_json_path}")
+    exo_intrinsic, exo_extrinsic, ego_intrinsic, ego_extrinsics_list = load_camera_params_from_meta(
+        args.meta_json_path, args.input_dir
+    )
     
-    logger.info(f"Loading ego camera poses from {args.ego_camera_pose_path}")
-    ego_intrinsics, ego_extrinsics_list = load_ego_camera_poses(args.ego_camera_pose_path, input_dir=args.input_dir)
+    # Convert exo_extrinsic (4x4 world to cam) to T_cam_to_world (4x4 cam to world)
+    T_cam_to_world = np.linalg.inv(exo_extrinsic)
     
     # Choose background building method based on use_mean_bg flag
     if getattr(args, 'use_mean_bg', False):
         logger.info(f"Building NANMEAN background point cloud from {args.input_dir}")
-        global_points_bg, global_colors_bg, image_size, T_cam_to_world, csv_camera_center = build_mean_background_pointcloud(
-            args.input_dir, args.exo_camera_pose_path
+        global_points_bg, global_colors_bg, image_size = build_mean_background_pointcloud(
+            args.input_dir, T_cam_to_world
         )
     else:
         logger.info(f"Building standard background point cloud from {args.input_dir}")
-        global_points_bg, global_colors_bg, image_size, T_cam_to_world, csv_camera_center = build_background_pointcloud(
-            args.input_dir, args.exo_camera_pose_path
+        global_points_bg, global_colors_bg, image_size = build_background_pointcloud(
+            args.input_dir, T_cam_to_world
         )
     
     if len(global_points_bg) == 0:
@@ -1817,11 +1389,8 @@ def main():
     fixed_image_size = (448, 448)  # (height, width)
     logger.info(f"Using fixed rendering resolution: {fixed_image_size[0]} x {fixed_image_size[1]} (H x W)")
     
-    # Validate frame range and render frames with sequential processing
-    total_frames_available = len(ego_extrinsics_list)
-    
     # Validate frame range using dedicated function
-    effective_end_frame, num_frames_to_render = validate_frame_range(args, total_frames_available, args.input_dir)
+    validate_frame_range(args, len(ego_extrinsics_list), args.input_dir)
     
     # Check if fish-eye rendering is enabled
     fish_eye_enabled = getattr(args, 'fish_eye_rendering', False)
@@ -1829,28 +1398,7 @@ def main():
     # Get online calibration path
     online_calib_path = getattr(args, 'online_calibration_path', None)
     
-    # Load Aria's original resolution from calibration file if needed for consistency check
-    aria_original_size = None
-    if fish_eye_enabled and online_calib_path:
-        try:
-            _, _, _, _, _, aria_original_size = load_aria_distortion_coeffs(online_calib_path)
-        except Exception as e:
-            logger.warning(f"Could not preload Aria original size for consistency check: {e}")
-
-    # Perform coordinate system consistency checks using the background point cloud
-    check_coordinate_system_consistency(
-        T_cam_to_world=T_cam_to_world,
-        ego_intrinsics=ego_intrinsics,
-        ego_extrinsics_list=ego_extrinsics_list,
-        global_points=global_points_bg,
-        csv_camera_center=csv_camera_center,
-        image_size=fixed_image_size,
-        is_fisheye=fish_eye_enabled,
-        online_calibration_path=args.online_calibration_path,
-        original_image_size=aria_original_size, # Pass the correct original size
-        cam_id=cam_id # Pass the parsed camera ID
-    )
-    
+    num_frames_to_render = args.end_frame - args.start_frame + 1
     render_mode = "fish-eye" if fish_eye_enabled else "perspective"
     logger.info(f"Rendering {num_frames_to_render} frames sequentially with {render_mode} mode")
     
@@ -1860,41 +1408,48 @@ def main():
         logger.info("Using default fish-eye distortion coefficients")
     
     # Select extrinsics for the frames to render
-    # Use source frame parameters if provided, otherwise fall back to render frame parameters
-    if hasattr(args, 'source_start_frame') and args.source_start_frame is not None:
-        extrinsics_start = args.source_start_frame
-        extrinsics_end = args.source_end_frame if hasattr(args, 'source_end_frame') and args.source_end_frame is not None else effective_end_frame
-        logger.info(f"Using source frame range for extrinsics: {extrinsics_start} to {extrinsics_end}")
-    else:
-        raise ValueError("source_start_frame and source_end_frame must be provided")
+    extrinsics_start = args.start_frame
+    extrinsics_end = args.end_frame
+    logger.info(f"Using frame range for extrinsics: {extrinsics_start} to {extrinsics_end}")
     
-    ego_extrinsics_to_render = ego_extrinsics_list[extrinsics_start:extrinsics_end + 1]  # +1 for inclusive end
-
+    ego_extrinsics_to_render = ego_extrinsics_list[extrinsics_start:extrinsics_end + 1]  # args.end_frame(enclusive) + 1
     # Find artifact path for dynamic per-frame construction
     artifact_paths = list(ArtifactPath.glob_artifacts(Path(args.input_dir), use_video=True))
     artifact_path = artifact_paths[0] if artifact_paths else None
 
     # Render all frames using sequential processing; per-frame dynamic points are built inside
     rendered_images = project_points_to_image_sequential(
-        global_points_bg, global_colors_bg, ego_extrinsics_to_render, ego_intrinsics,
+        global_points_bg, global_colors_bg, ego_extrinsics_to_render, ego_intrinsic,
         fixed_image_size, args.point_size, use_fisheye=fish_eye_enabled,
         online_calibration_path=online_calib_path,
-        original_image_size=aria_original_size, # Pass the correct original size
+        original_image_size=(2880, 2880), # Ego-Exo4D Ego view resolution
         artifact_path=artifact_path,
         T_cam_to_world=T_cam_to_world,
         only_bg=args.only_bg
     )
 
-    # Save images returned by the renderer
-    for relative_idx, rendered_image in enumerate(rendered_images):
-        actual_frame_idx = args.start_frame + relative_idx
-        output_path = os.path.join(args.out_dir, f"frame_{actual_frame_idx:06d}.png")
-        cv2.imwrite(output_path, cv2.cvtColor(rendered_image, cv2.COLOR_RGB2BGR))
-
-        if relative_idx % 10 == 0:
-            logger.info(f"Saved frame {actual_frame_idx} (relative idx: {relative_idx}) to {output_path}")
+    # Save images returned by the renderer as MP4 video
+    import imageio
     
-    logger.info(f"Rendering complete. Saved {num_frames_to_render} frames to {args.out_dir}")
+    # Extract video name from input_dir (e.g., vipe_results/YOUR_VIPE_RESULT -> YOUR_VIPE_RESULT)
+    # Use the configured output directory (already includes video_name)
+    os.makedirs(args.out_dir, exist_ok=True)
+    
+    # Save as {out_dir}/ego_Prior.mp4
+    output_video_path = os.path.join(args.out_dir, "ego_Prior.mp4")
+    
+    # Save as MP4 with 30 FPS
+    logger.info(f"Saving rendered frames as MP4 video at 30 FPS: {output_video_path}")
+    
+    with imageio.get_writer(output_video_path, fps=30, codec='libx264', quality=8, pixelformat='yuv420p') as writer:
+        for relative_idx, rendered_image in enumerate(rendered_images):
+            actual_frame_idx = args.start_frame + relative_idx
+            writer.append_data(rendered_image)
+            
+            if relative_idx % 10 == 0:
+                logger.info(f"Processing frame {actual_frame_idx} (relative idx: {relative_idx})")
+    
+    logger.info(f"Rendering complete. Saved {num_frames_to_render} frames to {output_video_path}")
     logger.info(f"Used sequential processing for stability with {render_mode} rendering")
 
 if __name__ == "__main__":

@@ -21,3 +21,5 @@ hydra-core
 ray
 ninja
 viser
+pandas
+scipy
