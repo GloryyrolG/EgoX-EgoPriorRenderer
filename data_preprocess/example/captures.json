@@ -1,0 +1,144 @@
+[
+  {
+    "root_dir": "captures/cmu_bike06",
+    "capture_name": "cmu_bike06",
+    "capture_uid": "f1c235a1-922c-4533-b8db-3b6019f06273",
+    "university_name": "cmu",
+    "origin_capture_id": "bike06",
+    "physical_setting_uid": 98,
+    "ds_recorded": 1690034400,
+    "has_trajectory": true,
+    "has_gaze": true,
+    "has_postsurvey": true,
+    "cameras": [
+      {
+        "cam_id": "aria01",
+        "is_ego": true,
+        "has_walkaround": true,
+        "includes_audio": true,
+        "device_type": "aria",
+        "relative_path": "videos/aria01.vrs",
+        "video_artifact_uid": "c51fdd1b-ce29-41e9-b235-8c18bde028dd"
+      },
+      {
+        "cam_id": "cam01",
+        "is_ego": false,
+        "has_walkaround": false,
+        "includes_audio": true,
+        "device_type": "hero10",
+        "relative_path": "videos/cam01.mp4",
+        "video_artifact_uid": "b63a9421-a2bf-4d62-b107-bfaed660802b"
+      },
+      {
+        "cam_id": "cam02",
+        "is_ego": false,
+        "has_walkaround": false,
+        "includes_audio": true,
+        "device_type": "hero10",
+        "relative_path": "videos/cam02.mp4",
+        "video_artifact_uid": "71a2508e-da20-42d3-a709-d2517665b612"
+      },
+      {
+        "cam_id": "cam03",
+        "is_ego": false,
+        "has_walkaround": false,
+        "includes_audio": true,
+        "device_type": "hero10",
+        "relative_path": "videos/cam03.mp4",
+        "video_artifact_uid": "4c4f8670-ebe5-4b0a-9840-eb70357f5e4e"
+      },
+      {
+        "cam_id": "cam04",
+        "is_ego": false,
+        "has_walkaround": false,
+        "includes_audio": true,
+        "device_type": "hero10",
+        "relative_path": "videos/cam04.mp4",
+        "video_artifact_uid": "611c8aa4-6dff-45f0-936d-9bfb27a437cb"
+      },
+      {
+        "cam_id": "moblie",
+        "is_ego": false,
+        "has_walkaround": false,
+        "includes_audio": true,
+        "device_type": "hero10",
+        "relative_path": "videos/moblie.mp4",
+        "video_artifact_uid": "0626116c-2baa-4803-91aa-99378395c50c"
+      }
+    ],
+    "timesync_uid": "277fef54-1aa7-4243-bbea-f95736c814f0",
+    "timesync_validated": true,
+    "validated": true
+  },
+  {
+    "root_dir": "captures/cmu_bike08",
+    "capture_name": "cmu_bike08",
+    "capture_uid": "f6e9016b-9af1-4d4d-ba1d-678050340d0d",
+    "university_name": "cmu",
+    "origin_capture_id": "bike08",
+    "physical_setting_uid": 98,
+    "ds_recorded": 1690034400,
+    "has_trajectory": true,
+    "has_gaze": true,
+    "has_postsurvey": true,
+    "cameras": [
+      {
+        "cam_id": "aria01",
+        "is_ego": true,
+        "has_walkaround": true,
+        "includes_audio": true,
+        "device_type": "aria",
+        "relative_path": "videos/aria01.vrs",
+        "video_artifact_uid": "3bec2fc4-66c5-4d1d-af5c-be9d6fa2f63f"
+      },
+      {
+        "cam_id": "cam01",
+        "is_ego": false,
+        "has_walkaround": false,
+        "includes_audio": true,
+        "device_type": "hero10",
+        "relative_path": "videos/cam01.mp4",
+        "video_artifact_uid": "36438b1c-7fd4-4957-89c7-351191f81864"
+      },
+      {
+        "cam_id": "cam02",
+        "is_ego": false,
+        "has_walkaround": false,
+        "includes_audio": true,
+        "device_type": "hero10",
+        "relative_path": "videos/cam02.mp4",
+        "video_artifact_uid": "898534ce-cece-4141-9ebf-b16ec01baeee"
+      },
+      {
+        "cam_id": "cam03",
+        "is_ego": false,
+        "has_walkaround": false,
+        "includes_audio": true,
+        "device_type": "hero10",
+        "relative_path": "videos/cam03.mp4",
+        "video_artifact_uid": "69e0a303-0ef0-446a-829c-3a0d02223b57"
+      },
+      {
+        "cam_id": "cam04",
+        "is_ego": false,
+        "has_walkaround": false,
+        "includes_audio": true,
+        "device_type": "hero10",
+        "relative_path": "videos/cam04.mp4",
+        "video_artifact_uid": "f1e871f6-0bf9-4906-8450-60e3d7604ad3"
+      },
+      {
+        "cam_id": "moblie",
+        "is_ego": false,
+        "has_walkaround": false,
+        "includes_audio": true,
+        "device_type": "hero10",
+        "relative_path": "videos/moblie.mp4",
+        "video_artifact_uid": "5973ec3e-c16c-46f3-af03-f9faf817dcd5"
+      }
+    ],
+    "timesync_uid": "9bec38b4-880d-4426-ad7e-652050ce7263",
+    "timesync_validated": true,
+    "validated": true
+  }
+]
