@@ -4,23 +4,6 @@
 
 `ViPE` provides point cloud rendering functionality to visualize the 3D reconstruction results. This is particularly useful for analyzing the spatial structure and quality of the estimated depth maps and camera poses.
 
-## 🚀 Quick Start
-
-To get started quickly with the example data:
-
-```bash
-bash data_preprocess/scripts/infer_vipe_all_takes.sh
-```
-
-This will process the example data in `data_preprocess/example/` and generate ego prior videos. The script automatically:
-- Runs ViPE inference on all takes in the example dataset
-- Generates `meta.json` files from ego pose annotations
-- Renders ego prior videos for each camera
-- Selects the best camera based on quality metrics
-- Saves results to `data_preprocess/data/{START_FRAME}_{END_FRAME}/best_ego_view_rendering/`
-
-For custom datasets, configure `data_preprocess/scripts/config.sh` with your data paths before running the script. See the [EgoExo4D Training Data Preprocessing](#-egoexo4d-training-data-preprocessing) section for detailed instructions.
-
 ## 👀 Installation
 
 To ensure the reproducibility, we recommend creating the runtime environment using [conda](https://docs.conda.io/projects/conda/en/latest/user-guide/getting-started.html).
@@ -213,6 +196,23 @@ This script will:
 ## 👀 EgoExo4D Training Data Preprocessing
 
 For pre-processing of EgoExo4D data for training EgoX, we provide a comprehensive preprocessing pipeline that automates ViPE inference and ego prior rendering for multiple takes.
+
+### 🚀 Quick Start
+
+To get started quickly with the example data:
+
+```bash
+bash data_preprocess/scripts/infer_vipe_all_takes.sh
+```
+
+This will process the example data in `data_preprocess/example/` and generate ego prior videos. The script automatically:
+- Runs ViPE inference on all takes in the example dataset
+- Generates `meta.json` files from ego pose annotations
+- Renders ego prior videos for each camera
+- Selects the best camera based on quality metrics
+- Saves results to `data_preprocess/data/{START_FRAME}_{END_FRAME}/best_ego_view_rendering/`
+
+For custom datasets, configure `data_preprocess/scripts/config.sh` with your data paths before running the script. See the sections below for detailed instructions.
 
 ### Data Structure
 
