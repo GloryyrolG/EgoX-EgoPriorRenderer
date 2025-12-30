@@ -5,8 +5,14 @@
 # Modify the values below to customize the pipeline behavior.
 
 # Paths
+# REPO_ROOT: Root directory of the repository (auto-detected if not set)
+# WORKING_DIR: Output directory (relative to REPO_ROOT or absolute path)
+# DATA_DIR: Input data directory (relative to REPO_ROOT or absolute path)
 WORKING_DIR="data_preprocess"  # Output directory
 DATA_DIR="data_preprocess/example"  # Input data directory (read-only)
+
+# Dataset
+EGO4D_DATASET_TYPE="test"  # Dataset type: "test", "train", or "val"
 
 # Frame range
 START_FRAME=0
@@ -27,10 +33,28 @@ if [[ -z "${END_FRAME:-}" ]]; then
     END_FRAME=$((START_FRAME + 49 - 1))
 fi
 
+# Auto-detect REPO_ROOT if not set (assumes config.sh is in data_preprocess/scripts/)
+if [[ -z "${REPO_ROOT:-}" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+fi
+
+# Convert relative paths to absolute paths
+if [[ "$WORKING_DIR" != /* ]]; then
+    WORKING_DIR="$(cd "$REPO_ROOT" && cd "$WORKING_DIR" 2>/dev/null && pwd || echo "$REPO_ROOT/$WORKING_DIR")"
+fi
+if [[ "$DATA_DIR" != /* ]]; then
+    DATA_DIR="$(cd "$REPO_ROOT" && cd "$DATA_DIR" 2>/dev/null && pwd || echo "$REPO_ROOT/$DATA_DIR")"
+fi
+
 # Validate directories
 if [[ ! -d "$WORKING_DIR" ]]; then
-    echo "⚠️  WARNING: WORKING_DIR does not exist: $WORKING_DIR" >&2
+    echo "❌ ERROR: WORKING_DIR does not exist: $WORKING_DIR" >&2
+    echo "   Please set WORKING_DIR in config.sh to a valid directory" >&2
+    exit 1
 fi
 if [[ ! -d "$DATA_DIR" ]]; then
-    echo "⚠️  WARNING: DATA_DIR does not exist: $DATA_DIR" >&2
+    echo "❌ ERROR: DATA_DIR does not exist: $DATA_DIR" >&2
+    echo "   Please set DATA_DIR in config.sh to a valid directory" >&2
+    exit 1
 fi

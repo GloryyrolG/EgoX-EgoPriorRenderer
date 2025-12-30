@@ -15,15 +15,23 @@ if [[ -f "$CONFIG_FILE" ]]; then
     echo "📖 Loading configuration from: $CONFIG_FILE"
     source "$CONFIG_FILE"
 else
-    echo "⚠️  WARNING: Config file not found: $CONFIG_FILE" >&2
-    echo "   Using default values. Please create $CONFIG_FILE" >&2
-    WORKING_DIR="/home/nas5/kinamkim/Repos/EgoX-EgoPriorRenderer/data_preprocess"
-    DATA_DIR="/home/nas5/kinamkim/Repos/EgoX-EgoPriorRenderer/.READ/test"
-    START_FRAME=0
-    END_FRAME=$((START_FRAME + 49 - 1))
-    POINT_SIZE="5.0"
-    BATCH_SIZE=6
-    UUID_MAPPING_FILE="${WORKING_DIR}/take_name_to_uuid_mapping.json"
+    echo "❌ ERROR: Config file not found: $CONFIG_FILE" >&2
+    echo "   Please create $CONFIG_FILE with required settings" >&2
+    echo "   See config.sh.example for a template" >&2
+    exit 1
+fi
+
+# Validate REPO_ROOT
+if [[ -z "${REPO_ROOT:-}" ]]; then
+    echo "❌ ERROR: REPO_ROOT is not set" >&2
+    echo "   Please set REPO_ROOT in config.sh or ensure it can be auto-detected" >&2
+    exit 1
+fi
+
+# Validate EGO4D_DATASET_TYPE
+if [[ -z "${EGO4D_DATASET_TYPE:-}" ]]; then
+    echo "⚠️  WARNING: EGO4D_DATASET_TYPE is not set, defaulting to 'test'" >&2
+    EGO4D_DATASET_TYPE="test"
 fi
 
 # ============================================================================
@@ -947,14 +955,21 @@ run_render() {
         render_end=0
     fi
     
-    local repo_root="/home/nas5/kinamkim/Repos/EgoX-EgoPriorRenderer"
-    if [[ -z "${PYTHONPATH:-}" ]]; then
-        export PYTHONPATH="$repo_root:${PYTHONPATH:-}"
-    else
-        export PYTHONPATH="$repo_root:$PYTHONPATH"
+    if [[ -z "${REPO_ROOT:-}" ]]; then
+        echo "ERROR: REPO_ROOT is not set. Please configure it in config.sh"
+        return 1
     fi
     
-    cd "$repo_root" || return 1
+    if [[ -z "${PYTHONPATH:-}" ]]; then
+        export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+    else
+        export PYTHONPATH="${REPO_ROOT}:$PYTHONPATH"
+    fi
+    
+    cd "${REPO_ROOT}" || {
+        echo "ERROR: Cannot change to REPO_ROOT: ${REPO_ROOT}"
+        return 1
+    }
     python scripts/render_vipe_pointcloud.py \
         --input_dir "$input_dir" \
         --out_dir "$OUTPUT_DIR" \
@@ -1018,13 +1033,21 @@ run_inference() {
         return 1
     fi
     
-    export EGO4D_DATASET_TYPE="test"
+    if [[ -z "${EGO4D_DATASET_TYPE:-}" ]]; then
+        echo "ERROR: EGO4D_DATASET_TYPE is not set. Please configure it in config.sh"
+        return 1
+    fi
+    export EGO4D_DATASET_TYPE="${EGO4D_DATASET_TYPE}"
     
-    local repo_root="/home/nas5/kinamkim/Repos/EgoX-EgoPriorRenderer"
+    if [[ -z "${REPO_ROOT:-}" ]]; then
+        echo "ERROR: REPO_ROOT is not set. Please configure it in config.sh"
+        return 1
+    fi
+    
     if [[ -z "${PYTHONPATH:-}" ]]; then
-        export PYTHONPATH="$repo_root:${PYTHONPATH:-}"
+        export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
     else
-        export PYTHONPATH="$repo_root:$PYTHONPATH"
+        export PYTHONPATH="${REPO_ROOT}:$PYTHONPATH"
     fi
 
     local total_frames=$(ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 "$video_path" 2>/dev/null || echo "0")
@@ -1074,7 +1097,10 @@ run_inference() {
         return 1
     fi
     
-    cd "$repo_root" || return 1
+    cd "${REPO_ROOT}" || {
+        echo "ERROR: Cannot change to REPO_ROOT: ${REPO_ROOT}"
+        return 1
+    }
     
     vipe infer "$temp_video_path" \
         --start_frame $actual_start \
