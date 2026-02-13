@@ -330,7 +330,7 @@ bash data_preprocess/scripts/infer_vipe_all_takes.sh --batch-size 8
 - Processing can be resumed: the script skips takes that already have completed results in `best_ego_view_rendering/`
 - Error logs are saved to `WORKING_DIR/data/{START_FRAME}_{END_FRAME}/.error/` for debugging
 - The best camera selection is based on rendering quality metrics (frames with white pixels, total white pixels)
-- **If you want to reproduce the train/val dataset**, please refer to the [dataset metadata](https://github.com/kdh8156/EgoX-EgoPriorRenderer/blob/main/data_preprocess/metadata.csv) and follow the preprocessing pipeline
+- **If you want to reproduce the train/val dataset**, please refer to the [dataset info](https://github.com/kdh8156/EgoX-EgoPriorRenderer/blob/main/data_preprocess/dataset_info.csv) and follow the preprocessing pipeline
 
 ## 🙏 Acknowledgements
 
