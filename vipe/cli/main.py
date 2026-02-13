@@ -90,7 +90,7 @@ def infer(video: Path, image_dir: Path, output: Path, pipeline: str, visualize: 
             raise click.Abort()
         
         overrides.append("pipeline.slam.optimize_intrinsics=false")
-        overrides.append(f"+pipeline.use_exo_intrinsic_gt={use_exo_intrinsic_gt}")
+        overrides.append(f"+pipeline.use_exo_intrinsic_gt='{use_exo_intrinsic_gt}'")  # parse error
         logger.info(f"Exo GT intrinsics mode enabled with provided matrix - intrinsics optimization will be disabled")
 
     # Set up stream configuration based on input type

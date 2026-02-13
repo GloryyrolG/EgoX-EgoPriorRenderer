@@ -4,7 +4,7 @@
 export CUDA_VISIBLE_DEVICES=0
 
 # Video path
-VIDEO_PATH="../example/in_the_wild/videos/joker/exo.mp4"
+VIDEO_PATH="../example/in_the_wild/videos/ironman/exo.mp4"
 
 # Inference settings
 START_FRAME=0

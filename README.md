@@ -176,6 +176,9 @@ After ViPE inference, you need to convert the depth maps from `.zip` archives (c
 python scripts/convert_depth_zip_to_npy.py \
   --depth_path {EgoX_path}/vipe_results/YOUR_VIDEO/depth \
   --egox_depthmaps_path {EgoX_path}/example/egoexo4D/depth_maps
+python scripts/convert_depth_zip_to_npy.py \
+  --depth_path ./vipe_results/subject1_h1_0_cam0/depth \
+  --egox_depthmaps_path ./processed/h2o/depth_maps
 ```
 
 This script will:

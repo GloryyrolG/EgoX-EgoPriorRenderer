@@ -889,7 +889,7 @@ def render_points_pytorch3d(points_world, colors_world, K, T_c2w=None, T_w2c=Non
 
     return final_img_rotated
 
-def render_points_fisheye(points_world, colors_world, T_w2c, ego_intrinsics, W=640, H=480, 
+def render_points_fisheye(points_world, colors_world, T_w2c, ego_intrinsics, W=640, H=480,
                          point_size=2, device="cuda",
                          radial_distortion_coeffs=None,
                          tangential_distortion_coeffs=None,
@@ -897,7 +897,8 @@ def render_points_fisheye(points_world, colors_world, T_w2c, ego_intrinsics, W=6
                          focal_length=None, principal_point=None,
                          original_image_size=None,
                          background_mode="solid", background_color=(0.0, 0.0, 0.0),
-                         noise_range=(0, 255), seed=42):
+                         noise_range=(0, 255), seed=42,
+                         is_aria=True, near_clip=0.3):
     """
     Render point cloud with fish-eye view using PyTorch3D FishEyeCameras.
     
@@ -973,15 +974,26 @@ def render_points_fisheye(points_world, colors_world, T_w2c, ego_intrinsics, W=6
         logger.warning("No points after magnitude filtering for fish-eye!")
         return (bg_img * 255).astype(np.uint8)
     
+    #TODO: test
+    # Filter near-plane points (e.g., ego wearer's own head reconstructed from exo view)
+    # Camera world position: cam_pos = -R^T @ t (since p_cam = R @ p_world + t)
+    cam_pos_world = -R_cv.T @ t_cv
+    distances = np.linalg.norm(pts_np - cam_pos_world.reshape(1, 3), axis=1)
+    logger.info(f"Fish-eye distance to camera: min={distances.min():.3f}, max={distances.max():.3f}")
+    near_keep = distances > near_clip
+    logger.info(f"Points after near-plane filter (>{near_clip}m): {near_keep.sum()}/{len(near_keep)}")
+    pts_np = pts_np[near_keep]
+    cols_np = cols_np[near_keep]
+    if pts_np.shape[0] == 0:
+        logger.warning("No points after near-plane filtering for fish-eye!")
+        return (bg_img * 255).astype(np.uint8)
+    logger.info(f"Final points for fish-eye rendering: {pts_np.shape[0]}")
+
     pts = torch.from_numpy(pts_np).to(device=device, dtype=torch.float32)
     cols = torch.from_numpy(cols_np).to(device=device, dtype=torch.float32)
     if cols.max() > 1.0:
         cols = cols / 255.0
-    
-    logger.info(f"Fish-eye camera point statistics after filtering:")
-    logger.info(f"  Distance to points: min={np.linalg.norm(pts_np - t_cv.reshape(1, 3), axis=1).min():.3f}, max={np.linalg.norm(pts_np - t_cv.reshape(1, 3), axis=1).max():.3f}")
-    logger.info(f"  Points after coordinate transform: {pts_np.shape[0]}")
-    
+
     # Create Pointclouds
     point_cloud = Pointclouds(points=[pts], features=[cols])
     
@@ -989,17 +1001,24 @@ def render_points_fisheye(points_world, colors_world, T_w2c, ego_intrinsics, W=6
     # This is the same transformation that cameras_from_opencv_projection does internally
     coord_transform_between_opencv_and_pytorch = np.array([
         [-1,  0,  0],
-        [ 0, -1,  0], 
+        [ 0, -1,  0],
         [ 0,  0,  1]
     ], dtype=np.float32)
-    coord_transform_for_aria_cam = np.array([
-        [ 0,  1,  0],
-        [-1,  0,  0], 
-        [ 0,  0,  1]
-    ], dtype=np.float32) # coord ccw 90 rotate
+
+    if is_aria:
+        # Aria cameras have a non-standard coordinate convention;
+        # apply an extra CCW 90-degree rotation to align axes.
+        coord_transform_for_aria_cam = np.array([
+            [ 0,  1,  0],
+            [-1,  0,  0],
+            [ 0,  0,  1]
+        ], dtype=np.float32)
+        coord_transform_total = coord_transform_between_opencv_and_pytorch @ coord_transform_for_aria_cam
+    else:
+        # Standard OpenCV cameras: only need OpenCV -> PyTorch3D conversion
+        coord_transform_total = coord_transform_between_opencv_and_pytorch
 
     # Apply coordinate transformation to rotation and translation
-    coord_transform_total = coord_transform_between_opencv_and_pytorch @ coord_transform_for_aria_cam
     R_pt3d = R_cv.T @ coord_transform_total
     t_pt3d = coord_transform_total.T @ t_cv
 
@@ -1109,7 +1128,9 @@ def project_points_to_image_sequential(bg_points_3d: np.ndarray, bg_colors: np.n
                                       original_image_size: Optional[Tuple[int, int]] = None,
                                       artifact_path: Optional[ArtifactPath] = None,
                                       T_cam_to_world: Optional[np.ndarray] = None,
-                                      only_bg: bool = False) -> List[np.ndarray]:
+                                      only_bg: bool = False,
+                                      is_aria: bool = True,
+                                      near_clip: float = 0.3) -> List[np.ndarray]:
     """
     Project 3D points to 2D images using ego camera poses with individual rendering.
     
@@ -1212,7 +1233,9 @@ def project_points_to_image_sequential(bg_points_3d: np.ndarray, bg_colors: np.n
                 principal_point=aria_principal_point,
                 original_image_size=aria_original_size, # Pass the correct original size
                 background_mode="solid",
-                background_color=(0.0, 0.0, 0.0)
+                background_color=(0.0, 0.0, 0.0),
+                is_aria=is_aria,
+                near_clip=near_clip
             )
         else:
             # Regular perspective rendering
@@ -1249,6 +1272,8 @@ def get_parser():
     parser.add_argument("--use_mean_bg", action="store_true", help="Use nanmean background instead of standard background")
     parser.add_argument("--fish_eye_rendering", action="store_true", help="Enable fish-eye rendering with 360-degree view")
     parser.add_argument("--online_calibration_path", type=str, default=None, help="(Optional) Path to online_calibration.jsonl file for real Aria distortion coefficients. If not provided, uses default Ego-Exo4D fisheye distortion coefficients.")
+    parser.add_argument("--no_aria", action="store_true", help="Disable Aria-specific coordinate transform and image rotation. Use for standard OpenCV cameras (e.g., H2O dataset).")
+    parser.add_argument("--near_clip", type=float, default=0.3, help="Filter points closer than this distance (meters) to ego camera. Useful for removing ego wearer's head/body. (default: 0.3)")
 
     return parser
 
@@ -1418,6 +1443,7 @@ def main():
     artifact_path = artifact_paths[0] if artifact_paths else None
 
     # Render all frames using sequential processing; per-frame dynamic points are built inside
+    is_aria = not getattr(args, 'no_aria', False)
     rendered_images = project_points_to_image_sequential(
         global_points_bg, global_colors_bg, ego_extrinsics_to_render, ego_intrinsic,
         fixed_image_size, args.point_size, use_fisheye=fish_eye_enabled,
@@ -1425,7 +1451,9 @@ def main():
         original_image_size=(2880, 2880), # Ego-Exo4D Ego view resolution
         artifact_path=artifact_path,
         T_cam_to_world=T_cam_to_world,
-        only_bg=args.only_bg
+        only_bg=args.only_bg,
+        is_aria=is_aria,
+        near_clip=args.near_clip
     )
 
     # Save images returned by the renderer as MP4 video
