@@ -119,9 +119,14 @@ def convert_depth_zip_to_npy(depth_zip_path: str, output_base_dir: str):
     if not HAS_OPENEXR:
         raise ImportError("OpenEXR library is required. Install with: pip install OpenEXR")
     
-    # Create output directory based on zip filename (without .zip extension)
-    zip_stem = Path(depth_zip_path).parts[-3]  # .stem
-    output_dir = os.path.join(output_base_dir, zip_stem)
+    # Keep exo/ego separated to avoid collisions under the same take.
+    # Example:
+    #   depth_zip_path: .../vipe_results/<take_name>/depth/exo.zip
+    #   output_dir:     <output_base_dir>/<take_name>/exo
+    zip_path = Path(depth_zip_path)
+    take_name = zip_path.parts[-3]
+    artifact_name = zip_path.stem
+    output_dir = os.path.join(output_base_dir, take_name, artifact_name)
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"Output directory: {output_dir}")
     

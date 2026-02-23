@@ -259,18 +259,21 @@ def load_camera_params_from_meta(meta_json_path: str, input_dir: str) -> Tuple[n
     with open(meta_json_path, 'r') as f:
         meta_data = json.load(f)
     
-    # Find matching sample
+    # Find matching sample: by exo_path parent (ViPE on exo) or by take_name / take_name_ego (ViPE on ego)
     matching_sample = None
     for sample in meta_data.get('test_datasets', []):
         exo_path = sample.get('exo_path', '')
-        # Check if parent directory name matches video_name
-        # e.g., './example/in_the_wild/videos/joker/exo.mp4' -> parent = 'joker'
         exo_parent = Path(exo_path).parent.name
+        take_name = sample.get('take_name', '')
         if exo_parent == video_name:
             matching_sample = sample
             logger.info(f"Found matching sample: exo_path='{exo_path}'")
             break
-    
+        if take_name and (video_name == take_name or video_name == take_name + '_ego'):
+            matching_sample = sample
+            logger.info(f"Found matching sample: take_name='{take_name}' (video_name='{video_name}')")
+            break
+
     if matching_sample is None:
         raise ValueError(f"No matching sample found for video_name='{video_name}' in {meta_json_path}")
     
@@ -301,10 +304,41 @@ def load_camera_params_from_meta(meta_json_path: str, input_dir: str) -> Tuple[n
     return exo_intrinsic, exo_extrinsic, ego_intrinsic, ego_extrinsics
 
 
+def resolve_artifact_path(input_dir: str, artifact_name: Optional[str] = None) -> ArtifactPath:
+    artifacts = list(ArtifactPath.glob_artifacts(Path(input_dir), use_video=True))
+    if not artifacts:
+        raise ValueError(f"No ViPE artifacts found in {input_dir}")
+    if artifact_name is None:
+        return artifacts[0]
+    for artifact in artifacts:
+        if artifact.artifact_name == artifact_name:
+            return artifact
+    available = ", ".join([a.artifact_name for a in artifacts])
+    raise ValueError(
+        f"Artifact '{artifact_name}' not found in {input_dir}. Available artifacts: [{available}]"
+    )
+
+
+def get_artifact_image_size(input_dir: str, artifact_name: str) -> Optional[Tuple[int, int]]:
+    """
+    Get (H, W) from the first RGB frame of a specific artifact.
+    Returns None if artifact/rgb cannot be resolved.
+    """
+    try:
+        artifact_path = resolve_artifact_path(input_dir, artifact_name)
+        for _, rgb in read_rgb_artifacts(artifact_path.rgb_path):
+            h, w = rgb.shape[:2]
+            return (int(h), int(w))
+    except Exception as e:
+        logger.warning(f"Failed to get image size for artifact '{artifact_name}': {e}")
+    return None
+
+
 def build_background_pointcloud(
         input_dir: str,
         T_cam_to_world: np.ndarray,
-        spatial_subsample: int = 2
+        spatial_subsample: int = 2,
+        artifact_name: Optional[str] = None
     ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int], np.ndarray]:
     """
     Build background-only global point cloud from all frames in world coordinates.
@@ -323,10 +357,7 @@ def build_background_pointcloud(
         image_size: (height, width) of original frames
     """
     # Use ViPE's ArtifactPath to find inference artifacts
-    artifacts = list(ArtifactPath.glob_artifacts(Path(input_dir), use_video=True))
-    if not artifacts:
-        raise ValueError(f"No ViPE artifacts found in {input_dir}")
-    artifact_path = artifacts[0]
+    artifact_path = resolve_artifact_path(input_dir, artifact_name)
 
 
     # Fallback to original depth-based method
@@ -478,7 +509,8 @@ def build_mean_background_pointcloud(
         input_dir: str,
         T_cam_to_world: np.ndarray,
         spatial_subsample: int = 2,
-        max_frames: int = None
+        max_frames: int = None,
+        artifact_name: Optional[str] = None
     ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int], np.ndarray]:
     """
     Build a static background point cloud using nanmean.
@@ -494,10 +526,7 @@ def build_mean_background_pointcloud(
         mean_bg_colors: Nx3 array of RGB colors (0-255) (nanmean background)
         image_size: (height, width) of original frames
     """
-    artifacts = list(ArtifactPath.glob_artifacts(Path(input_dir), use_video=True))
-    if not artifacts:
-        raise ValueError(f"No ViPE artifacts found in {input_dir}")
-    artifact_path = artifacts[0]
+    artifact_path = resolve_artifact_path(input_dir, artifact_name)
 
     # 최적화: 모든 유효한 프레임을 스택으로 수집
     valid_depth_frames = []
@@ -753,6 +782,8 @@ def build_dynamic_points_for_frame(artifact_path: ArtifactPath, frame_idx: int,
 
 def render_points_pytorch3d(points_world, colors_world, K, T_c2w=None, T_w2c=None,
                             W=640, H=480, point_size=2, device="cuda",
+                            original_image_size=None,
+                            is_aria: bool = True,
                             background_mode="solid", background_color=(0.0, 0.0, 0.0),
                             noise_range=(0, 255), seed=42):
     """
@@ -836,10 +867,19 @@ def render_points_pytorch3d(points_world, colors_world, K, T_c2w=None, T_w2c=Non
     # Pointclouds expects lists
     point_cloud = Pointclouds(points=[pts], features=[cols])
 
+    # Scale intrinsics when rendering at a different resolution.
+    K_use = np.asarray(K, dtype=np.float32).copy()
+    if original_image_size is not None:
+        fx, fy = float(K_use[0, 0]), float(K_use[1, 1])
+        cx, cy = float(K_use[0, 2]), float(K_use[1, 2])
+        fx, fy, cx, cy = scale_intrinsics(fx, fy, cx, cy, original_image_size, (H, W))
+        K_use[0, 0], K_use[1, 1] = fx, fy
+        K_use[0, 2], K_use[1, 2] = cx, cy
+
     # Build camera from OpenCV intrinsics/extrinsics
     R_cv_t = torch.as_tensor(R_cv, dtype=torch.float32, device=device).unsqueeze(0)    # (1,3,3)
     t_cv_t = torch.as_tensor(t_cv, dtype=torch.float32, device=device).unsqueeze(0)    # (1,3)
-    K_t    = torch.as_tensor(K,    dtype=torch.float32, device=device).unsqueeze(0)    # (1,3,3)
+    K_t    = torch.as_tensor(K_use, dtype=torch.float32, device=device).unsqueeze(0)   # (1,3,3)
     image_size_t = torch.tensor([[H, W]], dtype=torch.int64, device=device)            # (1,2)
 
     camera = cameras_from_opencv_projection(
@@ -884,10 +924,11 @@ def render_points_pytorch3d(points_world, colors_world, K, T_c2w=None, T_w2c=Non
     # Convert to uint8
     final_img_uint8 = (np.clip(final_img, 0.0, 1.0) * 255).astype(np.uint8)
     
-    # Apply simple 90-degree rotation to fix image orientation
-    final_img_rotated = cv2.rotate(final_img_uint8, cv2.ROTATE_90_CLOCKWISE)
+    # Only rotate for Aria-style orientation; standard cameras should keep native orientation.
+    if is_aria:
+        final_img_uint8 = cv2.rotate(final_img_uint8, cv2.ROTATE_90_CLOCKWISE)
 
-    return final_img_rotated
+    return final_img_uint8
 
 def render_points_fisheye(points_world, colors_world, T_w2c, ego_intrinsics, W=640, H=480,
                          point_size=2, device="cuda",
@@ -898,7 +939,7 @@ def render_points_fisheye(points_world, colors_world, T_w2c, ego_intrinsics, W=6
                          original_image_size=None,
                          background_mode="solid", background_color=(0.0, 0.0, 0.0),
                          noise_range=(0, 255), seed=42,
-                         is_aria=True, near_clip=0.3):
+                         is_aria=True, near_clip=0.4):
     """
     Render point cloud with fish-eye view using PyTorch3D FishEyeCameras.
     
@@ -1130,7 +1171,7 @@ def project_points_to_image_sequential(bg_points_3d: np.ndarray, bg_colors: np.n
                                       T_cam_to_world: Optional[np.ndarray] = None,
                                       only_bg: bool = False,
                                       is_aria: bool = True,
-                                      near_clip: float = 0.3) -> List[np.ndarray]:
+                                      near_clip: float = 0.4) -> List[np.ndarray]:
     """
     Project 3D points to 2D images using ego camera poses with individual rendering.
     
@@ -1248,6 +1289,8 @@ def project_points_to_image_sequential(bg_points_3d: np.ndarray, bg_colors: np.n
                 H=height,
                 point_size=point_size,
                 device="cuda" if torch.cuda.is_available() else "cpu",
+                original_image_size=aria_original_size,
+                is_aria=is_aria,
                 background_mode="solid",
                 background_color=(0.0, 0.0, 0.0)
             )
@@ -1273,46 +1316,42 @@ def get_parser():
     parser.add_argument("--fish_eye_rendering", action="store_true", help="Enable fish-eye rendering with 360-degree view")
     parser.add_argument("--online_calibration_path", type=str, default=None, help="(Optional) Path to online_calibration.jsonl file for real Aria distortion coefficients. If not provided, uses default Ego-Exo4D fisheye distortion coefficients.")
     parser.add_argument("--no_aria", action="store_true", help="Disable Aria-specific coordinate transform and image rotation. Use for standard OpenCV cameras (e.g., H2O dataset).")
-    parser.add_argument("--near_clip", type=float, default=0.3, help="Filter points closer than this distance (meters) to ego camera. Useful for removing ego wearer's head/body. (default: 0.3)")
+    parser.add_argument("--near_clip", type=float, default=0.4, help="Filter points closer than this distance (meters) to ego camera. Useful for removing ego wearer's head/body. (default: 0.4)")
+    parser.add_argument("--render_target", type=str, default="ego", choices=("ego", "exo"),
+                        help="Render to ego view (exo->ego) or exo view (ego->exo). Default: ego.")
+    parser.add_argument("--artifact_name", type=str, default=None,
+                        help="Artifact name in input_dir (e.g., exo or ego). When input_dir contains both, this must be set for deterministic behavior.")
+    parser.add_argument("--out_dir_no_append", action="store_true",
+                        help="Use --out_dir as final output dir without appending input_dir stem. Use for ego->exo to write exo_Prior.mp4 next to ego_Prior.mp4 (no overwrite: different filenames).")
 
     return parser
 
 def configure_output_directory(args) -> str:
     """
     Configure and construct the output directory path based on input arguments.
-    
-    Args:
-        args: Parsed command line arguments
-        
-    Returns:
-        str: Final configured output directory path
+    exo->ego writes ego_Prior.mp4; ego->exo writes exo_Prior.mp4 (no mutual overwrite).
     """
-    # Extract video name from input_dir (e.g., 'vipe_results/joker' -> 'joker')
+    if getattr(args, 'out_dir_no_append', False):
+        output_dir = args.out_dir
+        logger.info(f"Output directory (no append): {output_dir}")
+        return output_dir
     try:
         input_path = Path(args.input_dir)
-        video_name = input_path.stem  # Get the last component without extension
-        
-        # Final output: <provided_out_dir>/<video_name>
+        video_name = input_path.stem
         output_dir = os.path.join(args.out_dir, video_name)
         logger.info(f"Derived output directory: {output_dir}")
     except Exception as e:
         logger.warning(f"Failed to derive output dir from input_dir={getattr(args, 'input_dir', None)}: {e}")
         output_dir = args.out_dir
-
     return output_dir
 
-def get_inference_frame_range(input_dir: str) -> tuple[int, int]:
+def get_inference_frame_range(input_dir: str, artifact_name: Optional[str] = None) -> tuple[int, int]:
     """
     Get the frame range from ViPE inference results.
     Returns (start_frame, end_frame_inclusive) based on available pose data.
     """
     try:
-        # Find artifact paths in the input directory
-        artifact_paths = list(ArtifactPath.glob_artifacts(Path(input_dir), use_video=True))
-        if not artifact_paths:
-            raise ValueError(f"No VIPE artifacts found in {input_dir}")
-        
-        artifact_path = artifact_paths[0]
+        artifact_path = resolve_artifact_path(input_dir, artifact_name)
         
         # Load pose data to determine available frame range
         if not artifact_path.pose_path.exists():
@@ -1347,7 +1386,7 @@ def validate_frame_range(args, total_frames_available: int, input_dir: str):
         ValueError: If frame range doesn't exactly match inference results or is invalid
     """
     # Get inference frame range for validation
-    inference_start, inference_end = get_inference_frame_range(input_dir)
+    inference_start, inference_end = get_inference_frame_range(input_dir, getattr(args, "artifact_name", None))
     
     # Validate start_frame and end_frame
     if args.start_frame < 0:
@@ -1388,27 +1427,47 @@ def main():
     exo_intrinsic, exo_extrinsic, ego_intrinsic, ego_extrinsics_list = load_camera_params_from_meta(
         args.meta_json_path, args.input_dir
     )
-    
-    # Convert exo_extrinsic (4x4 world to cam) to T_cam_to_world (4x4 cam to world)
-    T_cam_to_world = np.linalg.inv(exo_extrinsic)
+    render_target = getattr(args, 'render_target', 'ego')
+    artifact_name = getattr(args, "artifact_name", None) or ("ego" if render_target == "exo" else "exo")
+    args.artifact_name = artifact_name
+    logger.info(f"Using artifact_name='{artifact_name}' in input_dir='{args.input_dir}'")
+
+    # World frame and render camera: exo->ego uses exo as world and renders to ego; ego->exo uses first ego as world and renders to exo
+    if render_target == 'exo':
+        T_cam_to_world = np.linalg.inv(ego_extrinsics_list[0])
+        logger.info("Render target: exo (ego->exo), world = first ego frame")
+    else:
+        T_cam_to_world = np.linalg.inv(exo_extrinsic)
+        logger.info("Render target: ego (exo->ego), world = exo frame")
     
     # Choose background building method based on use_mean_bg flag
     if getattr(args, 'use_mean_bg', False):
         logger.info(f"Building NANMEAN background point cloud from {args.input_dir}")
-        global_points_bg, global_colors_bg, image_size = build_mean_background_pointcloud(
-            args.input_dir, T_cam_to_world
+        global_points_bg, global_colors_bg, pointcloud_image_size = build_mean_background_pointcloud(
+            args.input_dir, T_cam_to_world, artifact_name=artifact_name
         )
     else:
         logger.info(f"Building standard background point cloud from {args.input_dir}")
-        global_points_bg, global_colors_bg, image_size = build_background_pointcloud(
-            args.input_dir, T_cam_to_world
+        global_points_bg, global_colors_bg, pointcloud_image_size = build_background_pointcloud(
+            args.input_dir, T_cam_to_world, artifact_name=artifact_name
         )
     
     if len(global_points_bg) == 0:
         logger.error("No points in background point cloud. Exiting.")
         return
     
-    logger.info(f"Original video resolution: {image_size[0]} x {image_size[1]} (H x W)")
+    logger.info(f"Pointcloud source resolution: {pointcloud_image_size[0]} x {pointcloud_image_size[1]} (H x W)")
+    render_original_image_size = pointcloud_image_size
+    if render_target == 'exo':
+        exo_image_size = get_artifact_image_size(args.input_dir, "exo")
+        if exo_image_size is not None:
+            assert exo_image_size == pointcloud_image_size, (
+                f"ego2exo currently assumes the pointcloud source resolution matches exo resolution, "
+                f"but got pointcloud={pointcloud_image_size}, exo={exo_image_size}. "
+                f"Please handle this mismatch before rendering."
+            )
+        else:
+            logger.warning("Could not resolve exo artifact resolution; continuing with pointcloud source resolution.")
     
     # Use fixed resolution for rendering
     fixed_image_size = (448, 448)  # (height, width)
@@ -1417,8 +1476,8 @@ def main():
     # Validate frame range using dedicated function
     validate_frame_range(args, len(ego_extrinsics_list), args.input_dir)
     
-    # Check if fish-eye rendering is enabled
-    fish_eye_enabled = getattr(args, 'fish_eye_rendering', False)
+    # Check if fish-eye rendering is enabled (exo target uses perspective only)
+    fish_eye_enabled = getattr(args, 'fish_eye_rendering', False) and (render_target != 'exo')
     
     # Get online calibration path
     online_calib_path = getattr(args, 'online_calibration_path', None)
@@ -1437,18 +1496,23 @@ def main():
     extrinsics_end = args.end_frame
     logger.info(f"Using frame range for extrinsics: {extrinsics_start} to {extrinsics_end}")
     
-    ego_extrinsics_to_render = ego_extrinsics_list[extrinsics_start:extrinsics_end + 1]  # args.end_frame(enclusive) + 1
+    num_frames_render = extrinsics_end - extrinsics_start + 1
+    if render_target == 'exo':
+        render_extrinsics = [exo_extrinsic] * num_frames_render
+        render_intrinsic = exo_intrinsic
+    else:
+        render_extrinsics = ego_extrinsics_list[extrinsics_start:extrinsics_end + 1]
+        render_intrinsic = ego_intrinsic
     # Find artifact path for dynamic per-frame construction
-    artifact_paths = list(ArtifactPath.glob_artifacts(Path(args.input_dir), use_video=True))
-    artifact_path = artifact_paths[0] if artifact_paths else None
+    artifact_path = resolve_artifact_path(args.input_dir, artifact_name)
 
     # Render all frames using sequential processing; per-frame dynamic points are built inside
     is_aria = not getattr(args, 'no_aria', False)
     rendered_images = project_points_to_image_sequential(
-        global_points_bg, global_colors_bg, ego_extrinsics_to_render, ego_intrinsic,
+        global_points_bg, global_colors_bg, render_extrinsics, render_intrinsic,
         fixed_image_size, args.point_size, use_fisheye=fish_eye_enabled,
         online_calibration_path=online_calib_path,
-        original_image_size=(2880, 2880), # Ego-Exo4D Ego view resolution
+        original_image_size=render_original_image_size,
         artifact_path=artifact_path,
         T_cam_to_world=T_cam_to_world,
         only_bg=args.only_bg,
@@ -1463,11 +1527,10 @@ def main():
     # Use the configured output directory (already includes video_name)
     os.makedirs(args.out_dir, exist_ok=True)
     
-    # Save as {out_dir}/ego_Prior.mp4
-    output_video_path = os.path.join(args.out_dir, "ego_Prior.mp4")
-    
-    # Save as MP4 with 30 FPS
-    logger.info(f"Saving rendered frames as MP4 video at 30 FPS: {output_video_path}")
+    prior_name = "exo_Prior.mp4" if render_target == 'exo' else "ego_Prior.mp4"
+    output_video_path = os.path.join(args.out_dir, prior_name)
+    # exo->ego: ego_Prior.mp4; ego->exo: exo_Prior.mp4 — different names, no overwrite when both run
+    logger.info(f"Saving rendered frames as MP4 at 30 FPS: {output_video_path}")
     
     with imageio.get_writer(output_video_path, fps=30, codec='libx264', quality=8, pixelformat='yuv420p') as writer:
         for relative_idx, rendered_image in enumerate(rendered_images):

@@ -5,6 +5,9 @@ Converts H2O dataset structure to EgoX-EgoPriorRenderer compatible format.
 
 Usage:
     python data_preprocess/h2o_to_egox.py --subject subject1 --scene h1 --sequence 0 --exo_cam cam0 --start_frame 0
+
+The script prints "Next steps" (ViPE infer + render). Those steps require the EgoX-EgoPriorRenderer
+conda environment and must be run from the EgoX-EgoPriorRenderer repo root.
 """
 
 import argparse
@@ -133,7 +136,7 @@ def create_video_from_images(image_dir, output_video, start_frame=0, num_frames=
     print(f"✓ Video created: {output_video}")
 
 
-def process_h2o_sequence(h2o_root, subject, scene, sequence, exo_cam, output_dir, fps=30, start_frame=0, end_frame=None):
+def process_h2o_sequence(h2o_root, subject, scene, sequence, exo_cam, output_dir, fps=30, start_frame=0, end_frame=None, vipe_results_root=None):
     """
     Process a single H2O sequence for EgoX.
 
@@ -190,6 +193,13 @@ def process_h2o_sequence(h2o_root, subject, scene, sequence, exo_cam, output_dir
     else:
         print(f"✓ Exo video exists: {exo_video}")
 
+    # 1b. Create ego video (for ego->exo: ViPE on ego, then render to exo)
+    ego_video = videos_dir / 'ego.mp4'
+    if not ego_video.exists():
+        create_video_from_images(ego_dir / 'rgb', ego_video, start_frame, num_frames, fps)
+    else:
+        print(f"✓ Ego video exists: {ego_video}")
+
     # 2. Load exo intrinsics
     exo_intrinsics, exo_w, exo_h = load_h2o_intrinsics(exo_dir / 'cam_intrinsics.txt')
     print(f"✓ Exo intrinsics loaded: {exo_w}x{exo_h}")
@@ -235,16 +245,23 @@ def process_h2o_sequence(h2o_root, subject, scene, sequence, exo_cam, output_dir
     # 6. Generate meta.json
     # Paths in meta.json should be relative to EgoX project root (one level above EgoX-EgoPriorRenderer)
     meta_path_prefix = Path("./EgoX-EgoPriorRenderer") / output_dir
+    # vipe_results_path: default to the same location suggested in "Next steps" below
+    vipe_root = Path(vipe_results_root) if vipe_results_root else (meta_path_prefix / "vipe_results")
+    vipe_results_path = vipe_root / take_name
     meta_data = {
         "test_datasets": [
             {
                 "exo_path": './' + str(meta_path_prefix / exo_video.relative_to(output_dir)),
+                "ego_path": './' + str(meta_path_prefix / ego_video.relative_to(output_dir)),
                 "ego_prior_path": './' + str(meta_path_prefix / (videos_dir / 'ego_Prior.mp4').relative_to(output_dir)),
                 "prompt": format_h2o_prompt(load_h2o_text(h2o_root, scene, sequence, start_frame, end_frame)),
                 "camera_intrinsics": exo_intrinsics,
                 "camera_extrinsics": exo_w2c,  # 3x4 world-to-camera
                 "ego_intrinsics": ego_intrinsics,
-                "ego_extrinsics": ego_extrinsics  # List of 3x4 per frame
+                "ego_extrinsics": ego_extrinsics,  # List of 3x4 per frame
+                "take_name": take_name,
+                "best_camera": "exo",
+                "vipe_results_path": './' + str(vipe_results_path),
             }
         ]
     }
@@ -255,27 +272,36 @@ def process_h2o_sequence(h2o_root, subject, scene, sequence, exo_cam, output_dir
 
     print(f"✓ Meta JSON created: {meta_json}")
 
+    end_rel = num_frames - 1
     print(f"\n{'='*60}")
     print(f"✅ Processing complete!")
     print(f"{'='*60}\n")
-    print(f"Next steps:")
+    print(f"Next steps (in EgoX-EgoPriorRenderer root, with its conda env):")
     print(f"1. Run ViPE inference:")
-    print(f"   cd /data/rongyu_chen/projs/EgoX/EgoX-EgoPriorRenderer")
     print(f"   vipe infer {exo_video} \\")
+    print(f"        --output {output_dir}/vipe_results \\")
     print(f"        --assume_fixed_camera_pose --pipeline lyra \\")
     print(f"        --use_exo_intrinsic_gt '[[{exo_intrinsics[0][0]},0,{exo_intrinsics[0][2]}],[0,{exo_intrinsics[1][1]},{exo_intrinsics[1][2]}],[0,0,1]]'")
     print(f"\n2. Render ego_Prior video:")
     print(f"   python scripts/render_vipe_pointcloud.py \\")
-    print(f"        --input_dir vipe_results/{take_name} \\")
+    print(f"        --input_dir {output_dir}/vipe_results/{take_name} --artifact_name exo \\")
     print(f"        --out_dir {videos_dir.parent} \\")
     print(f"        --meta_json_path {meta_json} \\")
     print(f"        --point_size 5.0 \\")
     print(f"        --start_frame 0 \\")
-    print(f"        --end_frame {num_frames - 1} \\")
+    print(f"        --end_frame {end_rel} \\")
     print(f"        --fish_eye_rendering \\")
     print(f"        --use_mean_bg \\")
     print(f"        --no_aria")
     print(f"\n3. Run EgoX inference with the generated meta.json")
+    print(f"\n(Optional) Ego->exo:")
+    print(f"   vipe infer {ego_video} --output {output_dir}/vipe_results --pipeline lyra \\")
+    print(f"        --start_frame 0 --end_frame {end_rel}")
+    print(f"   python scripts/render_vipe_pointcloud.py \\")
+    print(f"        --input_dir {output_dir}/vipe_results/{take_name} --artifact_name ego \\")
+    print(f"        --out_dir {videos_dir} --out_dir_no_append \\")
+    print(f"        --meta_json_path {meta_json} --render_target exo \\")
+    print(f"        --start_frame 0 --end_frame {end_rel} --point_size 5.0 --use_mean_bg --no_aria")
 
     return meta_json
 
@@ -301,6 +327,8 @@ def main():
                         help='Starting frame index')
     parser.add_argument('--end_frame', type=int, default=None,
                         help='Ending frame index (default: start_frame + 48)')
+    parser.add_argument('--vipe_results_root', type=str, default=None,
+                        help='Root dir of ViPE results (default: ./EgoX-EgoPriorRenderer/vipe_results). Set if vipe_results is elsewhere, e.g. processed/h2o/vipe_results.')
 
     args = parser.parse_args()
 
@@ -313,7 +341,8 @@ def main():
         output_dir=args.output_dir,
         fps=args.fps,
         start_frame=args.start_frame,
-        end_frame=args.end_frame
+        end_frame=args.end_frame,
+        vipe_results_root=args.vipe_results_root,
     )
 
 
