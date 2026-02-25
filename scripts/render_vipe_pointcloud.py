@@ -234,48 +234,46 @@ def load_aria_distortion_coeffs(
     return radial_distortion_coeffs, tangential_distortion_coeffs, thinPrism_distortion_coeffs, focal_length, principal_point
 
 
-def load_camera_params_from_meta(meta_json_path: str, input_dir: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[np.ndarray]]:
+def load_camera_params_from_meta(
+    meta_json_path: str,
+    input_dir: Optional[str] = None,
+    meta_data: Optional[dict] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[np.ndarray]]:
     """
     Load camera parameters from meta.json based on input directory.
-    
-    Args:
-        meta_json_path: Path to meta.json file
-        input_dir: Input directory path (e.g., 'vipe_results/joker')
-    
-    Returns:
-        exo_intrinsic: 3x3 exo camera intrinsics matrix
-        exo_extrinsic: 4x4 exo camera extrinsics matrix (world to cam)
-        ego_intrinsic: 3x3 ego camera intrinsics matrix  
-        ego_extrinsics: List of 4x4 ego camera extrinsics matrices for each frame (world to cam)
+    When input_dir is None, use the first test_datasets entry (e.g. for --gtdepth_dir mode).
+    When meta_data is provided, use it instead of reading the file (avoids double read).
     """
-    import json
     from pathlib import Path
-    
-    # Get video name from input_dir stem (e.g., 'joker' from 'vipe_results/joker')
-    video_name = Path(input_dir).stem
-    logger.info(f"Looking for video_name='{video_name}' in meta.json")
-    
-    # Load meta.json
-    with open(meta_json_path, 'r') as f:
-        meta_data = json.load(f)
-    
-    # Find matching sample: by exo_path parent (ViPE on exo) or by take_name / take_name_ego (ViPE on ego)
-    matching_sample = None
-    for sample in meta_data.get('test_datasets', []):
-        exo_path = sample.get('exo_path', '')
-        exo_parent = Path(exo_path).parent.name
-        take_name = sample.get('take_name', '')
-        if exo_parent == video_name:
-            matching_sample = sample
-            logger.info(f"Found matching sample: exo_path='{exo_path}'")
-            break
-        if take_name and (video_name == take_name or video_name == take_name + '_ego'):
-            matching_sample = sample
-            logger.info(f"Found matching sample: take_name='{take_name}' (video_name='{video_name}')")
-            break
 
-    if matching_sample is None:
-        raise ValueError(f"No matching sample found for video_name='{video_name}' in {meta_json_path}")
+    if meta_data is None:
+        with open(meta_json_path, 'r') as f:
+            meta_data = json.load(f)
+    samples = meta_data.get('test_datasets', [])
+    if not samples:
+        raise ValueError("No test_datasets in meta.json")
+
+    if input_dir is None:
+        matching_sample = samples[0]
+        logger.info("Using first test_datasets entry (input_dir=None)")
+    else:
+        video_name = Path(input_dir).stem
+        logger.info(f"Looking for video_name='{video_name}' in meta.json")
+        matching_sample = None
+        for sample in samples:
+            exo_path = sample.get('exo_path', '')
+            exo_parent = Path(exo_path).parent.name
+            take_name = sample.get('take_name', '')
+            if exo_parent == video_name:
+                matching_sample = sample
+                logger.info(f"Found matching sample: exo_path='{exo_path}'")
+                break
+            if take_name and (video_name == take_name or video_name == take_name + '_ego'):
+                matching_sample = sample
+                logger.info(f"Found matching sample: take_name='{take_name}' (video_name='{video_name}')")
+                break
+        if matching_sample is None:
+            raise ValueError(f"No matching sample found for video_name='{video_name}' in {meta_json_path}")
     
     # Extract camera parameters
     exo_intrinsic = np.array(matching_sample['camera_intrinsics'], dtype=np.float32)
@@ -304,6 +302,11 @@ def load_camera_params_from_meta(meta_json_path: str, input_dir: str) -> Tuple[n
     return exo_intrinsic, exo_extrinsic, ego_intrinsic, ego_extrinsics
 
 
+def _cam_to_world(pts_cam: np.ndarray, c2w: np.ndarray) -> np.ndarray:
+    """Transform (N,3) camera points to world using 4x4 c2w."""
+    return (c2w[:3, :3] @ pts_cam.T + c2w[:3, 3:4]).T
+
+
 def resolve_artifact_path(input_dir: str, artifact_name: Optional[str] = None) -> ArtifactPath:
     artifacts = list(ArtifactPath.glob_artifacts(Path(input_dir), use_video=True))
     if not artifacts:
@@ -317,6 +320,78 @@ def resolve_artifact_path(input_dir: str, artifact_name: Optional[str] = None) -
     raise ValueError(
         f"Artifact '{artifact_name}' not found in {input_dir}. Available artifacts: [{available}]"
     )
+
+
+def build_pointcloud_from_gtdepth(
+    gtdepth_dir: Path,
+    exo_intrinsic: np.ndarray,
+    exo_w2c: np.ndarray,
+    exo_rgb_path: Path,
+    start_frame: int,
+    end_frame: int,
+    spatial_subsample: int = 2,
+    depth_min_m: float = 0.05,
+    depth_max_m: float = 3.86,
+) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    """
+    Build point cloud from H2O-style GT depth (16-bit PNG, mm) and meta exo cam.
+    Uses meta exo intrinsics and exo extrinsics (w2c); points are output in world (exo c2w).
+    exo_rgb_path must be the full-take exo video (frame index f = global frame).
+    """
+    import imageio.v2 as imageio
+    exo_c2w = np.linalg.inv(exo_w2c)
+    fx, fy = float(exo_intrinsic[0, 0]), float(exo_intrinsic[1, 1])
+    cx, cy = float(exo_intrinsic[0, 2]), float(exo_intrinsic[1, 2])
+
+    all_pts = []
+    all_colors = []
+    image_size = None
+
+    reader = imageio.get_reader(str(exo_rgb_path), "ffmpeg")
+    for f in range(start_frame, end_frame + 1):
+        depth_path = gtdepth_dir / f"{f:06d}.png"
+        if not depth_path.exists():
+            logger.warning(f"GT depth not found: {depth_path}, skipping frame {f}")
+            continue
+        depth_raw = cv2.imread(str(depth_path), cv2.IMREAD_ANYDEPTH)
+        if depth_raw is None:
+            continue
+        depth_m = depth_raw.astype(np.float32) / 1000.0  # mm -> m
+        h, w = depth_m.shape
+        if image_size is None:
+            image_size = (h, w)
+
+        try:
+            rgb_frame = reader.get_data(f)
+        except Exception:
+            rgb_frame = np.zeros((h, w, 3), dtype=np.uint8)
+        rgb_frame = rgb_frame[::spatial_subsample, ::spatial_subsample]
+
+        vs, us = np.mgrid[0:h:spatial_subsample, 0:w:spatial_subsample]
+        Z = depth_m[::spatial_subsample, ::spatial_subsample]
+        valid = np.isfinite(Z) & (Z >= depth_min_m) & (Z <= depth_max_m)
+        if not np.any(valid):
+            continue
+        us = us.astype(np.float32)
+        vs = vs.astype(np.float32)
+        X_cam = (us - cx) * Z / fx
+        Y_cam = (vs - cy) * Z / fy
+        X_cam = X_cam[valid]
+        Y_cam = Y_cam[valid]
+        Z_cam = Z[valid]
+        pts_cam = np.stack([X_cam, Y_cam, Z_cam], axis=-1)
+        pts_world = _cam_to_world(pts_cam, exo_c2w)
+        colors = rgb_frame.reshape(-1, 3)[valid.reshape(-1)]
+        all_pts.append(pts_world)
+        all_colors.append(colors)
+    reader.close()
+
+    if not all_pts:
+        return np.empty((0, 3)), np.empty((0, 3)), image_size or (720, 1280)
+    global_points = np.concatenate(all_pts, axis=0)
+    global_colors = np.concatenate(all_colors, axis=0)
+    logger.info(f"Built point cloud from GT depth: {len(global_points)} points from frames [{start_frame},{end_frame}]")
+    return global_points, global_colors, image_size or (720, 1280)
 
 
 def get_artifact_image_size(input_dir: str, artifact_name: str) -> Optional[Tuple[int, int]]:
@@ -339,7 +414,7 @@ def build_background_pointcloud(
         T_cam_to_world: np.ndarray,
         spatial_subsample: int = 2,
         artifact_name: Optional[str] = None
-    ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int], np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
     """
     Build background-only global point cloud from all frames in world coordinates.
 
@@ -350,7 +425,7 @@ def build_background_pointcloud(
         input_dir: Path to ViPE inference results
         T_cam_to_world: 4x4 transformation matrix from camera to world coordinates
         spatial_subsample: Spatial subsampling factor for point cloud
-    
+
     Returns:
         global_points: Nx3 array of 3D points in world coordinates
         global_colors: Nx3 array of RGB colors (0-255)
@@ -433,7 +508,7 @@ def build_background_pointcloud(
 
         # Convert to world coordinates
         pcd_camera_flat = pcd_camera.reshape(-1, 3)  # (N, 3)
-        pcd_world_flat = (c2w[:3, :3] @ pcd_camera_flat.T + c2w[:3, 3:4]).T
+        pcd_world_flat = _cam_to_world(pcd_camera_flat, c2w)
         pcd_world = pcd_world_flat.reshape(pcd_camera.shape)  # Restore original shape
 
         # Apply depth mask
@@ -476,15 +551,11 @@ def build_background_pointcloud(
         global_points = global_points_transformed
         logger.info("Successfully transformed background point cloud to world coordinate system")
 
-        # Store transformation info for consistency checks
-        return global_points, global_colors, image_size, T_cam_to_world
+        return global_points, global_colors, image_size
 
     else:
-        global_points = np.empty((0, 3))
-        global_colors = np.empty((0, 3))
         logger.warning("No valid background points found in any frame")
-        T_cam_to_world = np.eye(4)
-        return global_points, global_colors, image_size
+        return np.empty((0, 3)), np.empty((0, 3)), image_size
     
 
 def compute_robust_mean_tensors(stacked_depth: torch.Tensor, stacked_rgb: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1304,7 +1375,7 @@ def project_points_to_image_sequential(bg_points_3d: np.ndarray, bg_colors: np.n
 
 def get_parser():
     parser = argparse.ArgumentParser(description="Render ViPE point cloud from ego view")
-    parser.add_argument("--input_dir", required=True, help="Directory containing ViPE artifacts")
+    parser.add_argument("--input_dir", required=False, default=None, help="Directory containing ViPE artifacts (omit when using --gtdepth_dir)")
     parser.add_argument("--out_dir", required=True, help="Output directory for rendered images")
     parser.add_argument("--meta_json_path", required=True, help="Path to meta.json file containing camera parameters")
     parser.add_argument("--point_size", type=float, default=1.0, help="Size of rendered points")
@@ -1321,8 +1392,17 @@ def get_parser():
                         help="Render to ego view (exo->ego) or exo view (ego->exo). Default: ego.")
     parser.add_argument("--artifact_name", type=str, default=None,
                         help="Artifact name in input_dir (e.g., exo or ego). When input_dir contains both, this must be set for deterministic behavior.")
+    parser.add_argument(
+        "--override_ego_intrinsics",
+        type=float,
+        nargs=4,
+        metavar=("FX", "FY", "CX", "CY"),
+        help="If set and render_target=='ego', override ego_intrinsics in meta.json with these (before any scaling).",
+    )
     parser.add_argument("--out_dir_no_append", action="store_true",
                         help="Use --out_dir as final output dir without appending input_dir stem. Use for ego->exo to write exo_Prior.mp4 next to ego_Prior.mp4 (no overwrite: different filenames).")
+    parser.add_argument("--gtdepth_dir", type=str, default=None,
+                        help="If set, build point cloud from H2O-style GT depth (16-bit PNG mm) under this dir (e.g. 000024.png). Uses meta exo intrinsics/extrinsics and exo RGB from meta exo_path. Replaces ViPE depth/pose for prior rendering.")
 
     return parser
 
@@ -1416,21 +1496,53 @@ def main():
     
     args = parser.parse_args()
 
-    # Configure output directory
-    args.out_dir = configure_output_directory(args)
-    
-    # Create output directory
+    use_gtdepth = getattr(args, "gtdepth_dir", None) is not None
+    if not use_gtdepth and not args.input_dir:
+        raise ValueError("Either --input_dir (ViPE results) or --gtdepth_dir must be provided.")
+
+    # Load meta for camera params (and for gtdepth: exo_path, take name)
+    with open(args.meta_json_path, "r") as f:
+        meta_data = json.load(f)
+    meta_list = meta_data.get("test_datasets", [])
+    if not meta_list:
+        raise ValueError("No test_datasets in meta.json")
+    sample = meta_list[0]
+
+    if use_gtdepth:
+        take_name = Path(sample["exo_path"]).parent.name
+        args.out_dir = os.path.join(args.out_dir, take_name)
+        logger.info(f"GT depth mode: output_dir={args.out_dir}")
+    else:
+        args.out_dir = configure_output_directory(args)
+
     os.makedirs(args.out_dir, exist_ok=True)
-    
-    # Load camera parameters from meta.json
-    logger.info(f"Loading camera parameters from {args.meta_json_path}")
-    exo_intrinsic, exo_extrinsic, ego_intrinsic, ego_extrinsics_list = load_camera_params_from_meta(
-        args.meta_json_path, args.input_dir
-    )
+
+    if use_gtdepth:
+        exo_intrinsic, exo_extrinsic, ego_intrinsic, ego_extrinsics_list = load_camera_params_from_meta(
+            args.meta_json_path, None, meta_data=meta_data
+        )
+    else:
+        logger.info(f"Loading camera parameters from {args.meta_json_path}")
+        exo_intrinsic, exo_extrinsic, ego_intrinsic, ego_extrinsics_list = load_camera_params_from_meta(
+            args.meta_json_path, args.input_dir
+        )
+    # Optional: override ego intrinsics for experimentation (e.g., use GT intrinsics instead of virtual ones)
     render_target = getattr(args, 'render_target', 'ego')
-    artifact_name = getattr(args, "artifact_name", None) or ("ego" if render_target == "exo" else "exo")
-    args.artifact_name = artifact_name
-    logger.info(f"Using artifact_name='{artifact_name}' in input_dir='{args.input_dir}'")
+    if getattr(args, "override_ego_intrinsics", None) is not None and render_target != "exo":
+        fx, fy, cx, cy = args.override_ego_intrinsics
+        ego_intrinsic = np.array(
+            [[float(fx), 0.0, float(cx)], [0.0, float(fy), float(cy)], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+        logger.info(
+            f"Overriding ego_intrinsics with fx={fx:.3f}, fy={fy:.3f}, cx={cx:.3f}, cy={cy:.3f}"
+        )
+    if not use_gtdepth:
+        artifact_name = getattr(args, "artifact_name", None) or ("ego" if render_target == "exo" else "exo")
+        args.artifact_name = artifact_name
+        logger.info(f"Using artifact_name='{artifact_name}' in input_dir='{args.input_dir}'")
+    else:
+        artifact_name = None
 
     # World frame and render camera: exo->ego uses exo as world and renders to ego; ego->exo uses first ego as world and renders to exo
     if render_target == 'exo':
@@ -1439,9 +1551,28 @@ def main():
     else:
         T_cam_to_world = np.linalg.inv(exo_extrinsic)
         logger.info("Render target: ego (exo->ego), world = exo frame")
-    
-    # Choose background building method based on use_mean_bg flag
-    if getattr(args, 'use_mean_bg', False):
+
+    if use_gtdepth:
+        exo_rgb_path = Path(sample["exo_path"]).resolve()
+        if not exo_rgb_path.exists():
+            exo_rgb_path = (Path.cwd() / sample["exo_path"].lstrip("./")).resolve()
+        if not exo_rgb_path.exists():
+            # exo_path in meta may be relative to repo root; try relative to meta.json dir
+            meta_dir = Path(args.meta_json_path).resolve().parent
+            exo_rel = Path(sample["exo_path"]).name
+            exo_parent = Path(sample["exo_path"]).parent.name
+            exo_rgb_path = (meta_dir / "videos" / exo_parent / "exo.mp4").resolve()
+        if not exo_rgb_path.exists():
+            raise FileNotFoundError(f"Exo video for RGB not found: {exo_rgb_path}")
+        global_points_bg, global_colors_bg, pointcloud_image_size = build_pointcloud_from_gtdepth(
+            Path(args.gtdepth_dir),
+            exo_intrinsic,
+            exo_extrinsic,
+            exo_rgb_path,
+            args.start_frame,
+            args.end_frame,
+        )
+    elif getattr(args, 'use_mean_bg', False):
         logger.info(f"Building NANMEAN background point cloud from {args.input_dir}")
         global_points_bg, global_colors_bg, pointcloud_image_size = build_mean_background_pointcloud(
             args.input_dir, T_cam_to_world, artifact_name=artifact_name
@@ -1472,9 +1603,19 @@ def main():
     # Use fixed resolution for rendering
     fixed_image_size = (448, 448)  # (height, width)
     logger.info(f"Using fixed rendering resolution: {fixed_image_size[0]} x {fixed_image_size[1]} (H x W)")
-    
-    # Validate frame range using dedicated function
-    validate_frame_range(args, len(ego_extrinsics_list), args.input_dir)
+    if render_target != 'exo' and getattr(args, 'override_ego_intrinsics', None) is not None:
+        render_original_image_size = fixed_image_size  # override values are already for 448x448, skip scaling
+
+    if not use_gtdepth:
+        validate_frame_range(args, len(ego_extrinsics_list), args.input_dir)
+    else:
+        if args.start_frame < 0 or args.end_frame < args.start_frame:
+            raise ValueError(f"Invalid frame range: start_frame={args.start_frame}, end_frame={args.end_frame}")
+        if args.end_frame >= len(ego_extrinsics_list):
+            raise ValueError(
+                f"end_frame ({args.end_frame}) exceeds available ego extrinsics "
+                f"({len(ego_extrinsics_list)} frames, indices 0-{len(ego_extrinsics_list) - 1})"
+            )
     
     # Check if fish-eye rendering is enabled (exo target uses perspective only)
     fish_eye_enabled = getattr(args, 'fish_eye_rendering', False) and (render_target != 'exo')
@@ -1501,12 +1642,23 @@ def main():
         render_extrinsics = [exo_extrinsic] * num_frames_render
         render_intrinsic = exo_intrinsic
     else:
+        if extrinsics_end + 1 > len(ego_extrinsics_list):
+            raise ValueError(
+                f"end_frame ({extrinsics_end}) exceeds available ego extrinsics "
+                f"({len(ego_extrinsics_list)} frames, indices 0-{len(ego_extrinsics_list)-1})"
+            )
         render_extrinsics = ego_extrinsics_list[extrinsics_start:extrinsics_end + 1]
         render_intrinsic = ego_intrinsic
-    # Find artifact path for dynamic per-frame construction
-    artifact_path = resolve_artifact_path(args.input_dir, artifact_name)
+    if use_gtdepth:
+        artifact_path = None
+        only_bg_render = True
+        if not getattr(args, 'no_aria', False):
+            args.no_aria = True
+            logger.info("GT depth mode: using --no_aria (standard pinhole, e.g. H2O)")
+    else:
+        artifact_path = resolve_artifact_path(args.input_dir, artifact_name)
+        only_bg_render = args.only_bg
 
-    # Render all frames using sequential processing; per-frame dynamic points are built inside
     is_aria = not getattr(args, 'no_aria', False)
     rendered_images = project_points_to_image_sequential(
         global_points_bg, global_colors_bg, render_extrinsics, render_intrinsic,
@@ -1515,7 +1667,7 @@ def main():
         original_image_size=render_original_image_size,
         artifact_path=artifact_path,
         T_cam_to_world=T_cam_to_world,
-        only_bg=args.only_bg,
+        only_bg=only_bg_render,
         is_aria=is_aria,
         near_clip=args.near_clip
     )
@@ -1528,6 +1680,10 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     
     prior_name = "exo_Prior.mp4" if render_target == 'exo' else "ego_Prior.mp4"
+    if use_gtdepth:
+        prior_name = prior_name.replace(".mp4", "_gtdepth.mp4")
+    if render_target != "exo" and getattr(args, "override_ego_intrinsics", None) is not None:
+        prior_name = prior_name.replace(".mp4", "_gtint.mp4")
     output_video_path = os.path.join(args.out_dir, prior_name)
     # exo->ego: ego_Prior.mp4; ego->exo: exo_Prior.mp4 — different names, no overwrite when both run
     logger.info(f"Saving rendered frames as MP4 at 30 FPS: {output_video_path}")
