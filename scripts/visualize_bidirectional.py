@@ -1,12 +1,13 @@
 from pathlib import Path
 import json
 
-import cv2
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+import imageio.v2 as imageio
+from PIL import Image
 
 from vipe.utils.cameras import CameraType
 from vipe.utils.io import (
@@ -42,18 +43,44 @@ def camera_center_from_w2c(extr_3x4):
 
 
 def load_video_frame(video_path: Path, frame_idx: int):
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open video: {video_path}")
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    reader = imageio.get_reader(str(video_path), "ffmpeg")
+    total = reader.get_length()
     frame_idx = int(np.clip(frame_idx, 0, max(0, total - 1)))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-    ok, frame = cap.read()
-    cap.release()
-    if not ok:
-        raise RuntimeError(f"Cannot read frame {frame_idx} from {video_path}")
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame = reader.get_data(frame_idx)
+    reader.close()
     return frame, total, frame_idx
+
+
+PREPROC_MAX_FRAMES = 49
+PREPROC_HEIGHT = 448
+PREPROC_WIDTH = 1232
+
+
+def load_preprocessed_midframe(video_path: Path, video_type: str, frame_hint: int):
+    # Approximate dataset preprocessing: resize ego_gt / ego_prior frames
+    # to (PREPROC_HEIGHT, PREPROC_HEIGHT) without keeping aspect ratio.
+    if isinstance(video_path, Path):
+        video_path = video_path.as_posix()
+    reader = imageio.get_reader(str(video_path), "ffmpeg")
+    try:
+        total_raw = reader.get_length()
+    except Exception:
+        total_raw = None
+
+    frame_idx = frame_hint
+    if total_raw is not None and total_raw > 0:
+        frame_idx = int(np.clip(frame_hint, 0, total_raw - 1))
+    frame = reader.get_data(frame_idx)
+    reader.close()
+
+    target_h = PREPROC_HEIGHT
+    target_w = PREPROC_HEIGHT  # ego branch uses square width=height
+    frame_resized = np.array(
+        Image.fromarray(frame).resize((target_w, target_h), resample=Image.BILINEAR)
+    )
+
+    total_effective = total_raw if total_raw is not None else PREPROC_MAX_FRAMES
+    return frame_resized.astype(np.uint8), total_effective, frame_idx
 
 
 def get_midframe_pointcloud(input_dir: Path, artifact_name: str, agg_window: int = DEFAULT_AGG_WINDOW):
@@ -164,6 +191,7 @@ def main():
             "traj_name": "ego",
             "traj": ego_traj,
             "prior_video": videos_dir / "ego_Prior.mp4",
+            "gt_video": videos_dir / "ego.mp4",
         },
         {
             "title": "ego->exo",
@@ -171,6 +199,7 @@ def main():
             "traj_name": "exo",
             "traj": exo_center,
             "prior_video": videos_dir / "exo_Prior.mp4",
+            "gt_video": videos_dir / "exo.mp4",
         },
     ]
 
@@ -182,6 +211,7 @@ def main():
         traj = cfg["traj"]
         traj_mid = min(mid_idx, len(traj) - 1)
         prior_img, prior_total, prior_mid = load_video_frame(cfg["prior_video"], mid_idx)
+        gt_img, gt_total, gt_mid = load_video_frame(cfg["gt_video"], mid_idx)
 
         ax1 = fig.add_subplot(2, 3, r * 3 + 1, projection="3d")
         ax1.scatter(points[:, 0], points[:, 1], points[:, 2], c=colors / 255.0, s=0.5, alpha=0.85)
@@ -210,6 +240,134 @@ def main():
     out_path = base / "viz_exo2ego_vs_ego2exo_midframe.png"
     fig.savefig(out_path, dpi=180)
     print(str(out_path))
+
+    # Additional figure: GT vs prior comparison (single figure)
+    fig2 = plt.figure(figsize=(18, 10))
+    for r, cfg in enumerate(rows):
+        _, _, n_frames, mid_idx, _, _ = get_midframe_pointcloud(
+            input_dir, cfg["pc_artifact"], agg_window=DEFAULT_AGG_WINDOW
+        )
+        # Use same preprocessing as dataset/infer for fair comparison
+        prior_img, prior_total, prior_mid = load_preprocessed_midframe(
+            cfg["prior_video"], "ego_prior", mid_idx
+        )
+        gt_img, gt_total, gt_mid = load_preprocessed_midframe(
+            cfg["gt_video"], "ego_gt", mid_idx
+        )
+
+        # Ensure same spatial size for visualization, but keep prior aspect ratio.
+        h, w = gt_img.shape[:2]
+        ph, pw = prior_img.shape[:2]
+        if (ph, pw) != (h, w):
+            scale = min(h / ph, w / pw)
+            new_h = max(1, int(round(ph * scale)))
+            new_w = max(1, int(round(pw * scale)))
+            prior_resized_small = np.array(
+                Image.fromarray(prior_img).resize((new_w, new_h), resample=Image.BILINEAR)
+            )
+            prior_img_resized = np.zeros_like(gt_img)
+            top = (h - new_h) // 2
+            left = (w - new_w) // 2
+            prior_img_resized[top : top + new_h, left : left + new_w] = prior_resized_small
+        else:
+            prior_img_resized = prior_img
+
+        overlay = (
+            0.5 * gt_img.astype(np.float32) + 0.5 * prior_img_resized.astype(np.float32)
+        ).clip(0, 255).astype(np.uint8)
+
+        # Column 1: GT
+        ax_gt = fig2.add_subplot(2, 3, r * 3 + 1)
+        ax_gt.imshow(gt_img)
+        ax_gt.set_title(
+            f"{cfg['title']} | GT frame {gt_mid}/{gt_total}"
+        )
+        ax_gt.axis("off")
+
+        # Column 2: prior
+        ax_prior = fig2.add_subplot(2, 3, r * 3 + 2)
+        ax_prior.imshow(prior_img_resized)
+        ax_prior.set_title(
+            f"{cfg['title']} | prior frame {prior_mid}/{prior_total}"
+        )
+        ax_prior.axis("off")
+
+        # Column 3: overlay
+        ax_ov = fig2.add_subplot(2, 3, r * 3 + 3)
+        ax_ov.imshow(overlay)
+        diff_mean = float(np.abs(gt_img.astype(np.float32) - prior_img_resized.astype(np.float32)).mean())
+        ax_ov.set_title(
+            f"{cfg['title']} | overlay (mean diff={diff_mean:.2f})"
+        )
+        ax_ov.axis("off")
+
+    plt.tight_layout()
+    out_path2 = base / "viz_prior_vs_gt_midframe.png"
+    fig2.savefig(out_path2, dpi=180)
+    print(str(out_path2))
+
+    # GT vs gtdepth-prior overlay (exo->ego only); prefer GT-intrinsics version when present
+    gtdepth_prior = videos_dir / "ego_Prior_gtdepth_gtint.mp4"
+    if not gtdepth_prior.exists():
+        gtdepth_prior = videos_dir / "ego_Prior_gtdepth.mp4"
+    if gtdepth_prior.exists():
+        _, _, n_frames, mid_idx, _, _ = get_midframe_pointcloud(
+            input_dir, "exo", agg_window=DEFAULT_AGG_WINDOW
+        )
+        # gtdepth video may have fewer frames (e.g. single-frame render); clamp to its length
+        try:
+            _r = imageio.get_reader(str(gtdepth_prior), "ffmpeg")
+            gtdepth_len = _r.get_length()
+            _r.close()
+        except Exception:
+            gtdepth_len = 1
+        if not np.isfinite(gtdepth_len) or gtdepth_len <= 0:
+            gtdepth_len = 1
+        frame_for_gtdepth = int(np.clip(mid_idx, 0, gtdepth_len - 1))
+        prior_img, prior_total, prior_mid = load_preprocessed_midframe(
+            gtdepth_prior, "ego_prior", frame_for_gtdepth
+        )
+        gt_img, gt_total, gt_mid = load_preprocessed_midframe(
+            videos_dir / "ego.mp4", "ego_gt", mid_idx
+        )
+        h, w = gt_img.shape[:2]
+        ph, pw = prior_img.shape[:2]
+        if (ph, pw) != (h, w):
+            scale = min(h / ph, w / pw)
+            new_h = max(1, int(round(ph * scale)))
+            new_w = max(1, int(round(pw * scale)))
+            prior_resized_small = np.array(
+                Image.fromarray(prior_img).resize((new_w, new_h), resample=Image.BILINEAR)
+            )
+            prior_img_resized = np.zeros_like(gt_img)
+            top = (h - new_h) // 2
+            left = (w - new_w) // 2
+            prior_img_resized[top : top + new_h, left : left + new_w] = prior_resized_small
+        else:
+            prior_img_resized = prior_img
+        overlay = (
+            0.5 * gt_img.astype(np.float32) + 0.5 * prior_img_resized.astype(np.float32)
+        ).clip(0, 255).astype(np.uint8)
+        fig3 = plt.figure(figsize=(18, 6))
+        ax_gt = fig3.add_subplot(1, 3, 1)
+        ax_gt.imshow(gt_img)
+        ax_gt.set_title(f"GT frame {gt_mid}/{gt_total}")
+        ax_gt.axis("off")
+        ax_prior = fig3.add_subplot(1, 3, 2)
+        ax_prior.imshow(prior_img_resized)
+        ax_prior.set_title(f"gtdepth prior frame {prior_mid}/{prior_total}")
+        ax_prior.axis("off")
+        ax_ov = fig3.add_subplot(1, 3, 3)
+        ax_ov.imshow(overlay)
+        diff_mean = float(np.abs(gt_img.astype(np.float32) - prior_img_resized.astype(np.float32)).mean())
+        ax_ov.set_title(f"overlay (mean diff={diff_mean:.2f})")
+        ax_ov.axis("off")
+        plt.tight_layout()
+        out_path3 = base / "viz_prior_gtdepth_vs_gt_midframe.png"
+        fig3.savefig(out_path3, dpi=180)
+        print(str(out_path3))
+    else:
+        print(f"Skip gtdepth vs GT figure: {gtdepth_prior} not found.")
 
 
 if __name__ == "__main__":
