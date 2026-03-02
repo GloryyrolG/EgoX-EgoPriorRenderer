@@ -14,9 +14,9 @@ import argparse
 import json
 import numpy as np
 from pathlib import Path
-import cv2
 from tqdm import tqdm
 import subprocess
+import shutil
 
 
 def load_h2o_intrinsics(intrinsics_path):
@@ -70,17 +70,28 @@ def load_h2o_extrinsics(pose_dir, num_frames, start_frame=0):
     return extrinsics_list
 
 
-def load_h2o_text(h2o_root, scene, sequence, start_frame, end_frame):
+def load_h2o_text(h2o_root, scene, sequence, start_frame, end_frame, subject, text_root=None, default_prompt=None):
     """
     Load H2O text description closest to middle frame.
     Text files exist every 5 frames at taein/database/h2o/text/.../cam2/rgb/.
     """
-    text_dir = h2o_root.parent / 'taein' / 'database' / 'h2o' / 'text' / h2o_root.name / scene / str(sequence) / 'cam2' / 'rgb'
+    if text_root:
+        text_dir = Path(text_root) / subject / scene / str(sequence) / 'cam2' / 'rgb'
+    else:
+        candidates = [
+            h2o_root.parent / 'egoworld' / 'text' / subject / scene / str(sequence) / 'cam2' / 'rgb',
+            h2o_root.parent / 'taein' / 'database' / 'h2o' / 'text' / h2o_root.name / scene / str(sequence) / 'cam2' / 'rgb',
+        ]
+        text_dir = next((p for p in candidates if p.exists()), candidates[0])
     mid_frame = (start_frame + end_frame) // 2
     nearest = round(mid_frame / 5) * 5
     text_file = text_dir / f"{nearest:06d}.txt"
 
     if not text_file.exists():
+        if default_prompt:
+            print(f"⚠ H2O text not found: {text_file}")
+            print(f"  Falling back to --default_prompt")
+            return default_prompt
         raise FileNotFoundError(f"H2O text not found: {text_file}")
 
     return text_file.read_text().strip()
@@ -115,8 +126,16 @@ def create_video_from_images(image_dir, output_video, start_frame=0, num_frames=
     """
     print(f"Creating video from {image_dir} (frames {start_frame}-{start_frame + num_frames - 1})...")
 
+    ffmpeg_bin = shutil.which('ffmpeg')
+    if ffmpeg_bin is None:
+        try:
+            import imageio_ffmpeg
+            ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            raise RuntimeError("ffmpeg not found in PATH, and imageio_ffmpeg fallback unavailable.")
+
     cmd = [
-        'ffmpeg',
+        ffmpeg_bin,
         '-y',
         '-framerate', str(fps),
         '-start_number', str(start_frame),
@@ -136,7 +155,21 @@ def create_video_from_images(image_dir, output_video, start_frame=0, num_frames=
     print(f"✓ Video created: {output_video}")
 
 
-def process_h2o_sequence(h2o_root, subject, scene, sequence, exo_cam, output_dir, fps=30, start_frame=0, end_frame=None, vipe_results_root=None):
+def process_h2o_sequence(
+    h2o_root,
+    subject,
+    scene,
+    sequence,
+    exo_cam,
+    output_dir,
+    fps=30,
+    start_frame=0,
+    end_frame=None,
+    vipe_results_root=None,
+    text_root=None,
+    default_prompt=None,
+    take_name_with_range=False,
+):
     """
     Process a single H2O sequence for EgoX.
 
@@ -183,6 +216,8 @@ def process_h2o_sequence(h2o_root, subject, scene, sequence, exo_cam, output_dir
 
     # Create output structure
     take_name = f"{subject}_{scene}_{sequence}_{exo_cam}"
+    if take_name_with_range:
+        take_name = f"{take_name}_{start_frame:06d}_{end_frame:06d}"
     videos_dir = output_dir / 'videos' / take_name
     videos_dir.mkdir(parents=True, exist_ok=True)
 
@@ -243,25 +278,35 @@ def process_h2o_sequence(h2o_root, subject, scene, sequence, exo_cam, output_dir
     print(f"✓ Ego extrinsics loaded: {len(ego_extrinsics)} frames")
 
     # 6. Generate meta.json
-    # Paths in meta.json should be relative to EgoX project root (one level above EgoX-EgoPriorRenderer)
-    meta_path_prefix = Path("./EgoX-EgoPriorRenderer") / output_dir
+    # Use absolute paths to avoid path-resolution ambiguity across different launch dirs.
     # vipe_results_path: default to the same location suggested in "Next steps" below
-    vipe_root = Path(vipe_results_root) if vipe_results_root else (meta_path_prefix / "vipe_results")
+    vipe_root = Path(vipe_results_root) if vipe_results_root else (output_dir / "vipe_results")
     vipe_results_path = vipe_root / take_name
     meta_data = {
         "test_datasets": [
             {
-                "exo_path": './' + str(meta_path_prefix / exo_video.relative_to(output_dir)),
-                "ego_path": './' + str(meta_path_prefix / ego_video.relative_to(output_dir)),
-                "ego_prior_path": './' + str(meta_path_prefix / (videos_dir / 'ego_Prior.mp4').relative_to(output_dir)),
-                "prompt": format_h2o_prompt(load_h2o_text(h2o_root, scene, sequence, start_frame, end_frame)),
+                "exo_path": str(exo_video.resolve()),
+                "ego_path": str(ego_video.resolve()),
+                "ego_prior_path": str((videos_dir / 'ego_Prior.mp4').resolve()),
+                "prompt": format_h2o_prompt(
+                    load_h2o_text(
+                        h2o_root,
+                        scene,
+                        sequence,
+                        start_frame,
+                        end_frame,
+                        subject,
+                        text_root=text_root,
+                        default_prompt=default_prompt,
+                    )
+                ),
                 "camera_intrinsics": exo_intrinsics,
                 "camera_extrinsics": exo_w2c,  # 3x4 world-to-camera
                 "ego_intrinsics": ego_intrinsics,
                 "ego_extrinsics": ego_extrinsics,  # List of 3x4 per frame
                 "take_name": take_name,
                 "best_camera": "exo",
-                "vipe_results_path": './' + str(vipe_results_path),
+                "vipe_results_path": str(vipe_results_path.resolve()),
             }
         ]
     }
@@ -293,10 +338,17 @@ def process_h2o_sequence(h2o_root, subject, scene, sequence, exo_cam, output_dir
     print(f"        --fish_eye_rendering \\")
     print(f"        --use_mean_bg \\")
     print(f"        --no_aria")
-    print(f"\n3. Run EgoX inference with the generated meta.json")
+    print(f"\n3. Convert ViPE depth zip -> EgoX depth_maps (.npy):")
+    print(f"   python scripts/convert_depth_zip_to_npy.py \\")
+    print(f"        --depth_path {output_dir}/vipe_results/{take_name}/depth \\")
+    print(f"        --egox_depthmaps_path {output_dir}/depth_maps")
+    print(f"\n4. Run EgoX inference with the generated meta.json")
     print(f"\n(Optional) Ego->exo:")
     print(f"   vipe infer {ego_video} --output {output_dir}/vipe_results --pipeline lyra \\")
     print(f"        --start_frame 0 --end_frame {end_rel}")
+    print(f"   python scripts/convert_depth_zip_to_npy.py \\")
+    print(f"        --depth_path {output_dir}/vipe_results/{take_name}/depth \\")
+    print(f"        --egox_depthmaps_path {output_dir}/depth_maps")
     print(f"   python scripts/render_vipe_pointcloud.py \\")
     print(f"        --input_dir {output_dir}/vipe_results/{take_name} --artifact_name ego \\")
     print(f"        --out_dir {videos_dir} --out_dir_no_append \\")
@@ -329,6 +381,12 @@ def main():
                         help='Ending frame index (default: start_frame + 48)')
     parser.add_argument('--vipe_results_root', type=str, default=None,
                         help='Root dir of ViPE results (default: ./EgoX-EgoPriorRenderer/vipe_results). Set if vipe_results is elsewhere, e.g. processed/h2o/vipe_results.')
+    parser.add_argument('--text_root', type=str, default=None,
+                        help='Root dir for H2O text annotations (expects {text_root}/{subject}/{scene}/{sequence}/cam2/rgb). If omitted, auto-detect common layouts.')
+    parser.add_argument('--default_prompt', type=str, default=None,
+                        help='Fallback prompt text used when H2O text file is missing.')
+    parser.add_argument('--take_name_with_range', action='store_true',
+                        help='Append frame range to take_name as ..._{start_frame}_{end_frame} to avoid collisions across windowed runs.')
 
     args = parser.parse_args()
 
@@ -343,6 +401,9 @@ def main():
         start_frame=args.start_frame,
         end_frame=args.end_frame,
         vipe_results_root=args.vipe_results_root,
+        text_root=args.text_root,
+        default_prompt=args.default_prompt,
+        take_name_with_range=args.take_name_with_range,
     )
 
 
