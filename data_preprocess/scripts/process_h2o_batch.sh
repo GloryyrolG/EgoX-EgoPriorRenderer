@@ -7,21 +7,26 @@ set -e
 
 # h2o_to_egox.py expects h2o_root as dataset root and appends --subject internally.
 # Override by exporting H2O_ROOT/TEXT_ROOT/OUTPUT_ROOT if needed.
-H2O_ROOT="${H2O_ROOT:-/mnt/egox/data/h2o/raw}"
-TEXT_ROOT="${TEXT_ROOT:-/mnt/egox/data/h2o/egoworld/text}"
+H2O_ROOT="${H2O_ROOT:-/mnt/shared/dses/h2o}"
+TEXT_ROOT="${TEXT_ROOT:-/mnt/shared/dses/egoworld/h2o/text}"
 DEFAULT_PROMPT="${DEFAULT_PROMPT:-}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/egox/data/processed/h2o_batch}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/shared/dses/egox/h2o_batch}"
 SCENE=${1:-"h1"}
 SEQUENCE=${2:-"0"}
 EXO_CAM=${3:-"cam0"}
 STRATEGY=${4:-"single"}  # single | no_overlap | overlap
 SUBJECT=${5:-"subject1"}
-RUN_POST=${6:-"1"}  # 1: run ego2exo post pipeline, 0: conversion only
+RUN_POST=${6:-${RUN_POST:-"1"}}  # 1: run ego2exo post pipeline, 0: conversion only
 EGOX_ENV="${EGOX_ENV:-egox-egoprior}"
 FLAT_SINGLE_OUTPUT="${FLAT_SINGLE_OUTPUT:-1}"  # 1: single strategy writes directly to OUTPUT_ROOT
 FLAT_MULTI_OUTPUT="${FLAT_MULTI_OUTPUT:-1}"    # 1: no_overlap/overlap also write to OUTPUT_ROOT
 RESUME_WINDOWS="${RESUME_WINDOWS:-1}"          # 1: skip windows that already have complete outputs
 DEPTH_ARTIFACT_POLICY="${DEPTH_ARTIFACT_POLICY:-any}"  # any | ego | exo | both
+
+# Optional upstream: extract H2O subset/full from tar before processing.
+EXTRACT_FROM_TAR="${EXTRACT_FROM_TAR:-1}"      # 1: untar before processing, 0: skip untar stage
+TAR_EXTRACT_MODE="${TAR_EXTRACT_MODE:-partial}"  # partial | full
+TAR_SOURCE_DIR="${TAR_SOURCE_DIR:-$H2O_ROOT}"  # where *.tar.gz is stored
 
 WINDOW_SIZE=49  # EgoX fixed window
 TOTAL_FRAMES="${TOTAL_FRAMES:-}"  # auto-detect if empty
@@ -29,6 +34,71 @@ TOTAL_FRAMES="${TOTAL_FRAMES:-}"  # auto-detect if empty
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "$REPO_ROOT"
+
+resolve_subject_tar_path() {
+    local candidates
+    candidates=$(find "$TAR_SOURCE_DIR" -maxdepth 1 -type f -name "${SUBJECT}*.tar.gz" | sort)
+    if [[ -z "$candidates" ]]; then
+        echo "❌ No tar.gz found for subject=${SUBJECT} under $TAR_SOURCE_DIR"
+        return 1
+    fi
+
+    # Prefer latest lexicographically (usually *_vX_Y.tar.gz).
+    echo "$candidates" | tail -n 1
+}
+
+has_required_h2o_subset() {
+    local base="${H2O_ROOT}/${SUBJECT}/${SCENE}/${SEQUENCE}"
+    local exo_base="${base}/${EXO_CAM}"
+    local ego_base="${base}/cam4"
+
+    [[ -f "${exo_base}/cam_intrinsics.txt" ]] &&
+    [[ -f "${ego_base}/cam_intrinsics.txt" ]] &&
+    [[ -d "${exo_base}/rgb" ]] &&
+    [[ -d "${exo_base}/cam_pose" ]] &&
+    [[ -d "${ego_base}/rgb" ]] &&
+    [[ -d "${ego_base}/cam_pose" ]]
+}
+
+extract_h2o_from_tar() {
+    if [[ "$EXTRACT_FROM_TAR" != "1" ]]; then
+        return 0
+    fi
+
+    local tar_path
+    tar_path=$(resolve_subject_tar_path) || return 1
+
+    mkdir -p "$H2O_ROOT"
+
+    if [[ "$TAR_EXTRACT_MODE" == "partial" ]]; then
+        if has_required_h2o_subset; then
+            echo "✅ [UNTAR] Required subset already exists, skip untar."
+            return 0
+        fi
+    fi
+
+    echo -e "\n[UNTAR] SUBJECT=${SUBJECT} MODE=${TAR_EXTRACT_MODE}"
+    echo "[UNTAR] tar: $tar_path"
+    echo "[UNTAR] dst: $H2O_ROOT"
+
+    if [[ "$TAR_EXTRACT_MODE" == "full" ]]; then
+        tar -xzf "$tar_path" -C "$H2O_ROOT" "${SUBJECT}/"
+    elif [[ "$TAR_EXTRACT_MODE" == "partial" ]]; then
+        local seq_base="${SUBJECT}/${SCENE}/${SEQUENCE}"
+        local exo_base="${seq_base}/${EXO_CAM}"
+        local ego_base="${seq_base}/cam4"
+        tar -xzf "$tar_path" -C "$H2O_ROOT" \
+            "${exo_base}/cam_intrinsics.txt" \
+            "${exo_base}/rgb/" \
+            "${exo_base}/cam_pose/" \
+            "${ego_base}/cam_intrinsics.txt" \
+            "${ego_base}/rgb/" \
+            "${ego_base}/cam_pose/"
+    else
+        echo "❌ Unsupported TAR_EXTRACT_MODE=${TAR_EXTRACT_MODE}, expected partial|full"
+        return 1
+    fi
+}
 
 merge_meta_entry() {
     local src_meta="$1"
@@ -122,6 +192,14 @@ PY
         --point_size 5.0 \
         --use_mean_bg \
         --no_aria
+
+    # Compatibility for downstream training code that still resolves ego_prior_path -> ego_Prior.mp4.
+    # For ego2exo flow we render exo_Prior.mp4, so create a sibling alias.
+    local exo_prior="${out_dir}/videos/${take_name}/exo_Prior.mp4"
+    local ego_prior_alias="${out_dir}/videos/${take_name}/ego_Prior.mp4"
+    if [[ -f "$exo_prior" ]]; then
+        ln -sfn "$(basename "$exo_prior")" "$ego_prior_alias"
+    fi
 
     echo -e "\n[Post] Convert depth zip -> npy"
     conda run -n "$EGOX_ENV" python scripts/convert_depth_zip_to_npy.py \
@@ -256,7 +334,12 @@ echo "EGOX_ENV: $EGOX_ENV"
 echo "RUN_POST: $RUN_POST"
 echo "FLAT_SINGLE_OUTPUT: $FLAT_SINGLE_OUTPUT"
 echo "FLAT_MULTI_OUTPUT: $FLAT_MULTI_OUTPUT"
+echo "EXTRACT_FROM_TAR: $EXTRACT_FROM_TAR"
+echo "TAR_EXTRACT_MODE: $TAR_EXTRACT_MODE"
+echo "TAR_SOURCE_DIR: $TAR_SOURCE_DIR"
 echo "=========================================="
+
+extract_h2o_from_tar
 
 if [[ -z "$TOTAL_FRAMES" ]]; then
     rgb_dir="${H2O_ROOT}/${SUBJECT}/${SCENE}/${SEQUENCE}/${EXO_CAM}/rgb"
